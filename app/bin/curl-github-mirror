@@ -1,0 +1,85 @@
+#!/bin/bash
+#
+# curl-github-mirror — curl 包装器
+#
+# 作用：对 github.com / objects.githubusercontent.com 的请求改走国内镜像，
+#       其余请求原样透传给真正的 curl。
+#
+# 镜像来源：环境变量 GITHUB_PREFIX（由 github-mirror-probe 探测得到），
+#           形如 https://v4.gh-proxy.org/https://github.com（已含 github.com）。
+#           未设置时用默认镜像。
+#
+# 设计：不改 MoviePilot 源码。local_setup.py 的 download_file / _download_to_stdout
+#       都通过 curl 下载，在 install_callback 里把本脚本所在目录置于 PATH 最前，
+#       并把本脚本软链为 curl，即可透明拦截 GitHub 下载。
+#
+# 健壮性：镜像不可用时自动降级为直连，不会因镜像故障导致安装失败。
+
+# 找到真正的 curl（排除自身）
+real_curl=""
+for c in /usr/local/bin/curl /usr/bin/curl /bin/curl; do
+    if [ -x "$c" ] && [ "$c" != "$0" ] && [ "$(readlink -f "$c" 2>/dev/null)" != "$(readlink -f "$0" 2>/dev/null)" ]; then
+        real_curl="$c"
+        break
+    fi
+done
+if [ -z "$real_curl" ]; then
+    real_curl="$(command -v curl 2>/dev/null)"
+fi
+[ -n "$real_curl" ] || { echo "curl-github-mirror: 真正的 curl 未找到" >&2; exit 127; }
+
+# 镜像前缀（探测得到，已含 github.com）；默认回退
+GITHUB_PREFIX="${GITHUB_PREFIX:-https://v4.gh-proxy.org/https://github.com}"
+
+# 判断一个参数是否是需要镜像的 GitHub URL
+is_github_url() {
+    case "$1" in
+        http://github.com/*|https://github.com/*|https://objects.githubusercontent.com/*|http://objects.githubusercontent.com/*)
+            return 0 ;;
+        *)
+            return 1 ;;
+    esac
+}
+
+# 改写 URL：把 https://github.com 替换成镜像前缀（前缀已含 github.com 路径）
+# 例：GITHUB_PREFIX=https://v4.gh-proxy.org/https://github.com
+#     https://github.com/foo/bar → https://v4.gh-proxy.org/https://github.com/foo/bar
+rewrite_url() {
+    local url="$1"
+    case "$url" in
+        https://github.com/*|http://github.com/*)
+            # 把 scheme://github.com 替换为镜像前缀
+            printf '%s%s' "${GITHUB_PREFIX}" "${url#*://github.com}" ;;
+        # release 实际下载会 302 到 objects.githubusercontent.com，前缀型镜像同样支持
+        https://objects.githubusercontent.com/*|http://objects.githubusercontent.com/*)
+            printf '%s%s' "${GITHUB_PREFIX%/https://github.com}/https://objects.githubusercontent.com" "${url#*://objects.githubusercontent.com}" ;;
+        *)
+            printf '%s' "$url" ;;
+    esac
+}
+
+# 遍历参数，对 GitHub URL 加镜像前缀，其余原样保留
+new_args=()
+for arg in "$@"; do
+    if is_github_url "$arg"; then
+        new_args+=("$(rewrite_url "$arg")")
+    else
+        new_args+=("$arg")
+    fi
+done
+
+# 先尝试镜像 URL
+if "$real_curl" "${new_args[@]}"; then
+    exit 0
+fi
+
+# 镜像失败 → 降级：用原始参数直连 GitHub
+need_fallback=0
+for arg in "$@"; do
+    if is_github_url "$arg"; then need_fallback=1; break; fi
+done
+if [ "$need_fallback" -eq 1 ]; then
+    "$real_curl" "$@" 2>/dev/null
+    exit $?
+fi
+exit 1

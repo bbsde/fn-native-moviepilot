@@ -1,0 +1,35 @@
+#!/bin/bash
+#
+# uninstall_callback — 卸载后执行
+#
+# 作用：停止残留进程，清理程序本体（源码/venv/前端）。
+# 共享区 @appshare/moviepilot 下的用户数据（config、数据库）由 fnOS 卸载流程
+#       按用户选择处理，本脚本不主动删除，避免误删用户数据。
+
+set -uo pipefail
+
+DATA_DIR="${TRIM_PKGVAR:-}"
+MP_ROOT="${DATA_DIR}/MoviePilot"
+NODE_RUNTIME_BIN="/var/apps/nodejs_v24/target/bin"
+INSTALL_LOG="${DATA_DIR}/install.log"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | [UNINSTALL] $*" | tee -a "${INSTALL_LOG}" 2>/dev/null || \
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | [UNINSTALL] $*"
+}
+
+# 停止运行中的进程（卸载前 fnOS 通常已 stop，这里做兜底）
+if [ -x "${MP_ROOT}/moviepilot" ]; then
+    log "停止 MoviePilot ..."
+    export PATH="${NODE_RUNTIME_BIN}:${PATH}"
+    ( cd "${MP_ROOT}" && ./moviepilot stop --timeout 30 ) >> "${INSTALL_LOG:-/dev/null}" 2>&1 || true
+fi
+
+# 清理程序本体（venv、源码、前端缓存），保留共享区用户数据
+if [ -d "${MP_ROOT}" ]; then
+    log "清理程序目录：${MP_ROOT}"
+    rm -rf "${MP_ROOT}"
+fi
+
+log "=== MoviePilot 已卸载（用户数据保留在共享区）==="
+exit 0
