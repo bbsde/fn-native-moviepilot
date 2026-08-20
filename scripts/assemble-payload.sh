@@ -90,10 +90,11 @@ fetch_source() {
 stage_source() {
     log "释放源码 → ${BUILD}/payload/MoviePilot"
     # 清空组装目录。目录本体可能被本机 shell 占为 CWD（Windows 句柄）删不掉，
-    # 退化为清空内容——顶层目录保留不影响后续（tar 释放进既有目录即可）
+    # 退化为清空内容——顶层目录保留不影响后续（tar 释放进既有目录即可）。
+    # 顺序必须「清空 → 删壳 → 建」：mkdir 之后再 find 会把新目录又删掉
+    find "${BUILD}/payload" -mindepth 1 -delete 2>/dev/null || true
     rm -rf "${BUILD}/payload" 2>/dev/null || true
     mkdir -p "${BUILD}/payload/MoviePilot"
-    find "${BUILD}/payload" -mindepth 1 -delete 2>/dev/null || true
     tar -xzf "${SRC_ARCHIVE}" -C "${BUILD}/payload/MoviePilot" --strip-components=1
     [ -f "${BUILD}/payload/MoviePilot/requirements.in" ] || die "源码包缺少 requirements.in（tag 异常？）"
     [ -f "${BUILD}/payload/MoviePilot/scripts/local_setup.py" ] || die "源码包缺少 scripts/local_setup.py"
@@ -279,7 +280,7 @@ PYEOF
     # 授权目录的祖先时合成「下一跳」虚拟子目录（授权清单由生命周期脚本维护
     # 于配置目录 fnos_grants.txt），浏览器得以逐级展开到授权目录本体（其内
     # 为原生真实读写）。上游重构 list/create_folder（锚点消失）→ 构建 die。
-    if ! grep -q '__fnos_grant_hop' \
+    if ! grep -q '__fnos_grant_view' \
         "${BUILD}/payload/MoviePilot/app/modules/filemanager/storages/local.py"; then
         (cd "${BUILD}/payload/MoviePilot/app/modules/filemanager/storages" && "${PY}" - <<'PYEOF' || die "fnOS 授权目录虚拟浏览补丁失败"
 import io
@@ -311,12 +312,11 @@ list_patched = (
     "                ret_items.append(self.__get_fileitem(item))\n"
     "        except PermissionError:\n"
     "            # fn-native-moviepilot 补丁：fnOS trimacl 卷未授权层可穿透不可\n"
-    "            # 列举，不再向上抛 500，交由下方授权目录虚拟浏览补齐\n"
+    "            # 列举，不再向上抛 500，交由下方授权目录虚拟浏览处理\n"
     "            pass\n"
-    "        # fn-native-moviepilot 补丁：过滤无权限子项（点开即空的浏览噪声）\n"
-    "        ret_items = self.__fnos_filter_accessible(ret_items)\n"
-    "        # fn-native-moviepilot 补丁：授权目录虚拟浏览（祖先层合成下一跳）\n"
-    "        ret_items = self.__fnos_grant_hop(path, ret_items)\n"
+    "        # fn-native-moviepilot 补丁：授权目录虚拟浏览（祖先层只显示授权链，\n"
+    "        # 授权目录内真实列举 + 无权限子项过滤）\n"
+    "        ret_items = self.__fnos_grant_view(path, ret_items)\n"
     "        return ret_items\n"
 )
 methods_anchor = "    def create_folder(self, fileitem: _SchemaFileItem, name: str) -> Optional[_SchemaFileItem]:\n"
@@ -354,32 +354,48 @@ methods_patched = '''    def __fnos_filter_accessible(self, items: List[_SchemaF
         except OSError:
             return []
 
-    def __fnos_grant_hop(self, path: str, items: List[_SchemaFileItem]) -> List[_SchemaFileItem]:
+    def __fnos_hop_items(self, base: str, hops) -> List[_SchemaFileItem]:
         """
-        fn-native-moviepilot 补丁：当前目录是某授权目录的祖先时，把各授权
-        路径相对当前目录的「下一跳」子目录合成进结果。应用用户在未授权
-        祖先层只有穿透权（fnOS trimacl），真实列举抛 PermissionError，
-        合成项让目录浏览器仍可逐级展开到授权目录本体（其内为原生读写）。
+        构造下一跳虚拟目录项。child 拼接必须规避双斜杠：base 为 / 时
+        f"{base}/{hop}" 会得到 //volN，前端原样展示且点击后路径失配。
         """
-        base = (path or "/").rstrip("/") or "/"
-        prefix = "/" if base == "/" else base + "/"
-        existing = {it.path.rstrip("/") for it in items}
-        hops = set()
-        for root in self.__fnos_granted_roots():
-            root = root.rstrip("/")
-            if root.startswith(prefix):
-                hops.add(root[len(prefix):].split("/", 1)[0])
-        for hop in sorted(hops):
-            child = f"{base}/{hop}"
-            if child in existing:
-                continue
+        ret = []
+        for hop in hops:
+            child = f"{base}/{hop}" if base != "/" else f"/{hop}"
             try:
-                items.append(self.__get_diritem(Path(child)))
+                ret.append(self.__get_diritem(Path(child)))
             except OSError:
-                items.append(_SchemaFileItem(
+                ret.append(_SchemaFileItem(
                     storage=self.schema.value, type="dir",
                     path=child + "/", name=hop, basename=hop,
                 ))
+        return ret
+
+    def __fnos_grant_view(self, path: str, items: List[_SchemaFileItem]) -> List[_SchemaFileItem]:
+        """
+        fn-native-moviepilot 补丁：授权目录虚拟浏览。
+        当前目录是某授权目录的祖先（含 / 本身）且不是授权目录时，只返回
+        授权链的下一跳虚拟目录——应用用户在这些层无列举权（fnOS trimacl），
+        也不应看到与授权无关的内容；授权目录本体及内部则返回真实列举
+        （过滤无权限子项），并补上更深授权的下一跳（按路径去重）。
+        """
+        base = (path or "/").rstrip("/") or "/"
+        prefix = "/" if base == "/" else base + "/"
+        roots = [r.rstrip("/") for r in self.__fnos_granted_roots()]
+        if not roots:
+            return items
+        hops = sorted({root[len(prefix):].split("/", 1)[0]
+                       for root in roots if root.startswith(prefix)})
+        if not hops:
+            return self.__fnos_filter_accessible(items)
+        if base not in roots:
+            return self.__fnos_hop_items(base, hops)
+        items = self.__fnos_filter_accessible(items)
+        existing = {it.path.rstrip("/") for it in items}
+        for hop in hops:
+            child = f"{base}/{hop}" if base != "/" else f"/{hop}"
+            if child not in existing:
+                items.extend(self.__fnos_hop_items(base, [hop]))
         return items
 
 '''
