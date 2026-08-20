@@ -248,6 +248,6 @@ v3 分支（新建，唯一活跃）：
 | lock 先写会被误判缓存完整 | 解析产物先落盘，下载中断后重跑命中「已缓存」跳过 | lock 先写 `lock.staging`，下载闭包完整后才转正 |
 | 上游 v3.0.0 init 缺陷 | `local_setup.py:2504` 引用不存在的 `app.application.security.access`（实际在 `security.token`），`init --superuser` 必炸（Docker 用户不跑 local_setup 故上游未察觉） | 构建期 sed 修正（stage_source 内，上游修复后自动失效） |
 | appcenter 上下文 venv 静默失败 | appcenter 安装环境里 `python3 -m venv` 两种模式均无输出失败（手动 root / moviepilot 用户 / 精简 PATH 均正常，成因未明） | venv 三级兜底：标准 → `--without-pip` → **手工构建**（pyvenv.cfg + bin/python 链接，不依赖 venv 模块）；手工路径已在真机验证；失败时记录 user/HOME/TMPDIR/PATH 快照 |
-| 上游 v3.0.0 媒体服务器实例缓存缺陷 | 配置错误时创建的 TrimeMedia 实例以失败状态被缓存，改对配置后不重建 → library/sync 全部 502「媒体服务器请求失败」（全新实例化验证一切正常：登录成功、拿到媒体库） | 用户侧遇此问题重启应用即愈（appcenter-cli stop/start）；属上游缺陷，非封装问题 |
+| 上游 v3.0.0 媒体服务器实例缓存缺陷 | 配置错误时创建的模块实例以失败状态被缓存，改对配置后不重建 → library/sync 全部 502「媒体服务器请求失败」。根因：ModuleManager 订阅了自身 `handle_config_changed`，但其注册的事件 resolver 只匹配受管模块类（app/modules/*），不认自身类 → 处理器被事件系统永久跳过（Emby/Jellyfin/下载器同理） | **构建期补丁已修复**（3.0.0.4）：resolver 先识别自身类；真机端到端验证坏密码→502、改回→立即 200 无需重启。上游修复后锚点消失自动停用 |
 | 上游密钥不持久化 | `SECRET_KEY`/`RESOURCE_SECRET_KEY` 默认每次进程启动随机生成 → 重启后所有 JWT 与图片签名失效，被迫重新登录 | install/upgrade 回调首生成后写入 app.env（已有值绝不覆盖）；真机验证 token 跨重启存活 |
 | 桥看门狗自杀后需正规启停 | 前端长时间不可达时网关桥主动退出（等 fnOS 拉起）；若用 moviepilot CLI 直接重启后端绕过 fnOS，桥不会复活 → 网关 Bad Gateway | 设备侧操作一律走 `sudo appcenter-cli stop/start moviepilot`，勿直接 CLI 重启后端 |
