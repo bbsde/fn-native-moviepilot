@@ -93,11 +93,9 @@ read_meta() {
 }
 
 # --------------------------------------------------------------------------
-# 前置检查（含真建测试 venv：Debian 的 python3-venv 拆包可能导致 ensurepip
-# 缺失，弱检查（venv --help）测不出来，必须真建一次验证 pip 可用）
+# 前置检查（venv 自检仅记录结论：真实验证与三级兜底在 create_venv，
+# appcenter 安装上下文与交互 shell 环境差异大，预检结果不能代表创建必败）
 # --------------------------------------------------------------------------
-VENV_BOOTSTRAP_PIP=0                    # 1 = 需用随包 pip wheel 自举
-
 preflight() {
     log "=== 前置检查 ==="
     [ -n "${APP_DEST:-}" ] || fail "TRIM_APPDEST 未设置"
@@ -119,7 +117,7 @@ preflight() {
         fail "未找到 nodejs_v24 运行时：${NODE_DEP_BIN}/node（manifest install_dep_apps 未生效？）"
     fi
 
-    # 真建测试 venv 验证 ensurepip 可用（mktemp 目录，验完即删）
+    # venv 能力自检（真建一次测试 venv；失败不阻断，create_venv 有三级兜底）
     local test_dir
     test_dir="$(mktemp -d)"
     if python3 -m venv "${test_dir}/t" >> "${INSTALL_LOG}" 2>&1 \
@@ -127,8 +125,7 @@ preflight() {
        && "${test_dir}/t/bin/pip" --version >/dev/null 2>&1; then
         log "venv 自检通过（ensurepip 可用）"
     else
-        VENV_BOOTSTRAP_PIP=1
-        log "[WARN] venv 自检失败（ensurepip 缺失），将用 --without-pip + 随包 pip wheel 自举"
+        log "[WARN] venv 自检未通过（ensurepip 缺失或环境受限），创建时将走 --without-pip / 手工构建兜底"
     fi
     rm -rf "${test_dir}"
 
@@ -181,32 +178,56 @@ setup_node_symlinks() {
 
 # --------------------------------------------------------------------------
 # 设备端 venv：离线 pip 安装（方案 A）
-# 正常路径 python3 -m venv + pip --no-index --find-links wheels；
-# ensurepip 缺失时 --without-pip + 随包 pip wheel 自举再继续。
+# 三级兜底（appcenter 安装上下文实测存在 python -m venv 静默失败的环境）：
+#   ① python3 -m venv（标准）② --without-pip ③ 手工构建（目录 + pyvenv.cfg
+#   + 符号链接，完全不依赖 venv 模块）——pip 一律由随包 wheel 自举补齐。
 # --------------------------------------------------------------------------
+# 手工构建 venv：等价于 venv 模块的核心产物（pyvenv.cfg + bin/python 链接 +
+# site-packages），venv 模块不可用/受限时的最终兜底。
+manual_venv() {
+    local venv_dir="$1"
+    local py_bin py_home py_full pyver
+    py_bin="$(command -v python3)"
+    py_home="$(dirname "${py_bin}")"
+    py_full="$("${py_bin}" -c 'import platform; print(platform.python_version())' 2>/dev/null)" || return 1
+    pyver="$("${py_bin}" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null)" || return 1
+    rm -rf "${venv_dir}"
+    mkdir -p "${venv_dir}/bin" "${venv_dir}/lib/python${pyver}/site-packages" "${venv_dir}/include" \
+        || return 1
+    printf 'home = %s\ninclude-system-site-packages = false\nversion = %s\n' \
+        "${py_home}" "${py_full}" > "${venv_dir}/pyvenv.cfg" || return 1
+    ln -sfn "${py_bin}" "${venv_dir}/bin/python3"
+    ln -sfn python3 "${venv_dir}/bin/python"
+    # 自证可用：venv 结构下 python 必须能定位自身 prefix 并跑起来
+    "${venv_dir}/bin/python" -c 'import sys; print("manual venv OK:", sys.prefix)' \
+        >> "${INSTALL_LOG}" 2>&1 || return 1
+}
+
 create_venv() {
     log "=== 创建虚拟环境（离线装配）==="
     local venv_dir="${MP_ROOT}/venv"
-    local venv_python="${venv_dir}/bin/python"
 
     rm -rf "${venv_dir}"
-    if [ "${VENV_BOOTSTRAP_PIP}" = "1" ]; then
-        python3 -m venv --without-pip "${venv_dir}" >> "${INSTALL_LOG}" 2>&1 \
-            || fail "venv 创建失败（--without-pip 模式）"
+    if python3 -m venv "${venv_dir}" >> "${INSTALL_LOG}" 2>&1; then
+        log "venv 创建成功（标准模式）"
+    elif python3 -m venv --without-pip "${venv_dir}" >> "${INSTALL_LOG}" 2>&1; then
+        log "venv 创建成功（--without-pip 模式，pip 稍后自举）"
     else
-        python3 -m venv "${venv_dir}" >> "${INSTALL_LOG}" 2>&1 \
-            || fail "venv 创建失败"
+        # 记录上下文快照供事后排查（appcenter 环境与交互 shell 差异大）
+        log "[WARN] python3 -m venv 两种模式均失败，转手工构建 venv"
+        log "[WARN] 诊断：user=$(id -un 2>/dev/null) HOME=${HOME:-未设置} TMPDIR=${TMPDIR:-未设置} PATH=${PATH}"
+        manual_venv "${venv_dir}" || fail "手工 venv 构建失败（详见 ${INSTALL_LOG}）"
+        log "venv 手工构建成功"
     fi
 
-    # 兜底：即便预检通过，真建 venv 仍可能没有 pip（预检与实际环境的拆包状态
-    # 理论上一致，此处防御性复核）——补走自举路径。
+    # pip 缺失（--without-pip / 手工模式 / ensurepip 半损）→ 随包 pip wheel 自举
     if [ ! -x "${venv_dir}/bin/pip" ]; then
-        log "[WARN] venv 缺少 pip，执行随包 pip wheel 自举"
         local pip_wheel
         pip_wheel="$(ls "${WHEELS_DIR}"/pip-*.whl 2>/dev/null | head -1)"
-        [ -n "${pip_wheel}" ] || fail "随包 wheels 缺少 pip wheel，无法自举"
-        "${venv_python}" "${pip_wheel}/pip" install --no-index --find-links "${WHEELS_DIR}" pip \
+        [ -n "${pip_wheel}" ] || fail "venv 缺少 pip 且随包 wheels 无 pip wheel，无法自举"
+        "${venv_dir}/bin/python" "${pip_wheel}/pip" install --no-index --find-links "${WHEELS_DIR}" pip \
             >> "${INSTALL_LOG}" 2>&1 || fail "pip wheel 自举失败"
+        log "pip 自举完成（$(basename "${pip_wheel}")）"
     fi
 
     log "离线安装依赖（wheels: $(ls "${WHEELS_DIR}" | wc -l) 个文件）..."
@@ -214,8 +235,8 @@ create_venv() {
             -r "${PAYLOAD_LOCK}" >> "${INSTALL_LOG}" 2>&1; then
         fail "依赖离线安装失败（详见 ${INSTALL_LOG}）"
     fi
-    [ -x "${venv_python}" ] || fail "venv python 不可用：${venv_python}"
-    log "venv 就绪：$("${venv_python}" --version 2>&1)"
+    [ -x "${venv_dir}/bin/python" ] || fail "venv python 不可用：${venv_dir}/bin/python"
+    log "venv 就绪：$("${venv_dir}/bin/python" --version 2>&1)"
 }
 
 # --------------------------------------------------------------------------

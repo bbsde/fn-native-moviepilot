@@ -95,6 +95,19 @@ stage_source() {
     [ -f "${BUILD}/payload/MoviePilot/requirements.in" ] || die "源码包缺少 requirements.in（tag 异常？）"
     [ -f "${BUILD}/payload/MoviePilot/scripts/local_setup.py" ] || die "源码包缺少 scripts/local_setup.py"
 
+    # 上游 v3.0.0 首日 bug：local_setup.py 的 _ensure_superuser_account_inner
+    # 引用不存在的 app.application.security.access（get_password_hash 实际在
+    # app.application.security.token），init --superuser 必炸。构建期修正；
+    # 上游修复/改动此行后 sed 自然失效（仅记录，不阻断）。
+    if grep -q 'from app.application.security.access import get_password_hash' \
+        "${BUILD}/payload/MoviePilot/scripts/local_setup.py"; then
+        sed -i 's|from app.application.security.access import get_password_hash|from app.application.security.token import get_password_hash|' \
+            "${BUILD}/payload/MoviePilot/scripts/local_setup.py"
+        log "已修正上游 v3.0.0 security.access 错误导入（→ security.token）"
+    else
+        log "上游 security.access 导入已不存在（上游已修复或结构变化），跳过补丁"
+    fi
+
     FRONTEND_VERSION="$("${PY}" -c '
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()

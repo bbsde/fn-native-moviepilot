@@ -132,8 +132,27 @@ fi
 
 if [ "${VENV_REUSED}" != "1" ] && [ -f "${PAYLOAD_LOCK}" ] && [ -d "${WHEELS_DIR}" ]; then
     rm -rf "${MP_ROOT}/venv"
-    if ! python3 -m venv "${MP_ROOT}/venv" >> "${INSTALL_LOG}" 2>&1; then
-        fail "venv 重建失败"
+    if python3 -m venv "${MP_ROOT}/venv" >> "${INSTALL_LOG}" 2>&1; then
+        log "venv 重建成功（标准模式）"
+    elif python3 -m venv --without-pip "${MP_ROOT}/venv" >> "${INSTALL_LOG}" 2>&1; then
+        log "venv 重建成功（--without-pip 模式）"
+    else
+        # 与 install_callback 相同的手工构建兜底（appcenter 上下文 -m venv 可能静默失败）
+        log "[WARN] python3 -m venv 两种模式均失败，转手工构建 venv"
+        log "[WARN] 诊断：user=$(id -un 2>/dev/null) HOME=${HOME:-未设置} TMPDIR=${TMPDIR:-未设置} PATH=${PATH}"
+        py_bin="$(command -v python3)"
+        py_home="$(dirname "${py_bin}")"
+        py_full="$("${py_bin}" -c 'import platform; print(platform.python_version())' 2>/dev/null)"
+        pyver="$("${py_bin}" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null)"
+        rm -rf "${MP_ROOT}/venv"
+        mkdir -p "${MP_ROOT}/venv/bin" "${MP_ROOT}/venv/lib/python${pyver}/site-packages" "${MP_ROOT}/venv/include"
+        printf 'home = %s\ninclude-system-site-packages = false\nversion = %s\n' \
+            "${py_home}" "${py_full}" > "${MP_ROOT}/venv/pyvenv.cfg"
+        ln -sfn "${py_bin}" "${MP_ROOT}/venv/bin/python3"
+        ln -sfn python3 "${MP_ROOT}/venv/bin/python"
+        "${MP_ROOT}/venv/bin/python" -c 'import sys; print("manual venv OK:", sys.prefix)' \
+            >> "${INSTALL_LOG}" 2>&1 || fail "手工 venv 构建失败"
+        log "venv 手工构建成功"
     fi
     if [ ! -x "${MP_ROOT}/venv/bin/pip" ]; then
         pip_wheel="$(ls "${WHEELS_DIR}"/pip-*.whl 2>/dev/null | head -1)"
