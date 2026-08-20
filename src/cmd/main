@@ -35,10 +35,18 @@ GATEWAY_SOCK="${TRIM_APPDEST}/app.sock"
 GATEWAY_PID="${TRIM_PKGVAR}/gateway-bridge.pid"
 GATEWAY_LOG="${TRIM_PKGVAR}/gateway-bridge.log"
 
-# MoviePilot 后端/前端端口（与上游 config.py 默认值一致）
-# 后端 FastAPI/uvicorn :3001，前端 service.js :3000
-BACKEND_PORT=3001
-FRONTEND_PORT=3000
+# MoviePilot 后端/前端端口：app.env 可配（NGINX_PORT=前端 / PORT=后端，
+# 安装/配置向导写入，上游原生支持）；缺省与上游默认一致（3001/3000）。
+# prepare_env 与 do_status 都要读（status 不走 prepare_env）。
+load_ports() {
+    local p
+    p="$(read_env_key NGINX_PORT 2>/dev/null)"
+    case "${p}" in ''|*[!0-9]*) p="3000" ;; esac
+    FRONTEND_PORT="${p}"
+    p="$(read_env_key PORT 2>/dev/null)"
+    case "${p}" in ''|*[!0-9]*) p="3001" ;; esac
+    BACKEND_PORT="${p}"
+}
 
 # 从共享区定位 config 目录（与 install_callback 保持一致）
 resolve_config_dir() {
@@ -179,6 +187,8 @@ prepare_env() {
         echo "无法定位配置目录（TRIM_DATA_SHARE_PATHS）" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
         exit 1
     }
+    # 端口跟随 app.env（向导可改；read_env_key 内部自 resolve_config_dir）
+    load_ports
     # Node 兜底：app.cli 的 _frontend_node_binary 优先用 .runtime/node/bin/node
     # （install_callback 已符号链接到 nodejs_v24），失败再 shutil.which("node")。
     # 这里把 nodejs_v24 加进 PATH 兜底。
@@ -233,7 +243,7 @@ start_gateway_bridge() {
         setpriv --reuid="${APP_USER}" --regid="${APP_GROUP}" --init-groups -- env \
             GATEWAY_PREFIX="${GATEWAY_PREFIX}" \
             LISTEN_SOCKET="${GATEWAY_SOCK}" \
-            UPSTREAM_HOST="127.0.0.1" UPSTREAM_PORT="3000" \
+            UPSTREAM_HOST="127.0.0.1" UPSTREAM_PORT="${FRONTEND_PORT}" \
             BRIDGE_LOGIN_USER="${login_user}" \
             BRIDGE_LOGIN_PASS="${login_pass}" \
             GATEWAY_LOG="${GATEWAY_LOG}" \
@@ -241,7 +251,7 @@ start_gateway_bridge() {
     else
         GATEWAY_PREFIX="${GATEWAY_PREFIX}" \
         LISTEN_SOCKET="${GATEWAY_SOCK}" \
-        UPSTREAM_HOST="127.0.0.1" UPSTREAM_PORT="3000" \
+        UPSTREAM_HOST="127.0.0.1" UPSTREAM_PORT="${FRONTEND_PORT}" \
         BRIDGE_LOGIN_USER="${login_user}" \
         BRIDGE_LOGIN_PASS="${login_pass}" \
         GATEWAY_LOG="${GATEWAY_LOG}" \
@@ -363,9 +373,10 @@ do_stop() {
 }
 
 do_status() {
-    # 双探测：前端 :3000 在服务 且 网关 socket 存在（桥在跑）才算运行中。
+    # 双探测：前端在服务 且 网关 socket 存在（桥在跑）才算运行中。
     # 任一缺失说明网关入口不可用，报告未运行以便 fnOS 触发重启。
-    if curl -sf --connect-timeout 2 http://127.0.0.1:3000/version.txt >/dev/null 2>&1 \
+    load_ports
+    if curl -sf --connect-timeout 2 "http://127.0.0.1:${FRONTEND_PORT}/version.txt" >/dev/null 2>&1 \
        && [ -S "${GATEWAY_SOCK}" ]; then
         exit 0
     fi

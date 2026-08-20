@@ -38,5 +38,26 @@
                 ]
             }
         ]
+    },
+    {
+        "stepTitle": "端口设置",
+        "items": [
+            {
+                "type": "tips",
+                "helpText": "前端网页与后端 API 各监听一个本机端口（仅本机监听，外部统一经 fnOS 网关访问，一般无需修改）。与其他应用端口冲突时可在此调整，保持默认直接下一步。<br>前后端端口不能相同；之后也可在 fnOS 应用设置的配置向导中修改。"
+            },
+            {
+                "type": "text",
+                "field": "wizard_nginx_port",
+                "label": "前端端口",
+                "initValue": "3000"
+            },
+            {
+                "type": "text",
+                "field": "wizard_port",
+                "label": "后端端口",
+                "initValue": "3001"
+            }
+        ]
     }
 ]

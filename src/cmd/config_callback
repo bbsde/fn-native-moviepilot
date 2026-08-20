@@ -11,6 +11,8 @@
 #   1) 网桥免登录账号绑定（wizard_superuser / wizard_password → app.env）
 #   2) 授权目录清单落盘（见 write_fnos_grants → fnos_grants.txt，
 #      MP 目录浏览器补丁据此在祖先层合成下一跳虚拟目录）
+#   3) 端口绑定（wizard_nginx_port / wizard_port → NGINX_PORT / PORT，
+#      变化时全量重启应用）
 #
 #   留空语义：wizard 字段留空 = 不修改当前值（保留 app.env 现有内容）。
 #
@@ -199,10 +201,97 @@ write_fnos_grants() {
     return 0
 }
 
+# --------------------------------------------------------------------------
+# 端口绑定（wizard_nginx_port / wizard_port → app.env 的 NGINX_PORT / PORT）
+#   与现值比对（缺省视为上游默认 3000/3001），未变化不动应用；真变化则需
+#   全量重启（前后端都要重新绑定监听端口，重启网关桥不够）。
+#   留空 = 不修改。前后端相同则拒绝。
+# --------------------------------------------------------------------------
+_port_valid() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+setup_ports() {
+    local fe="${wizard_nginx_port:-}" be="${wizard_port:-}"
+    [ -z "${fe}" ] && [ -z "${be}" ] && return 0
+
+    local config_dir env_file
+    config_dir="$(resolve_config_dir 2>/dev/null)" || {
+        log "[WARN] 无法定位 config 目录，端口未更新"
+        return 0
+    }
+    env_file="${config_dir}/app.env"
+    if [ ! -f "${env_file}" ]; then
+        log "[WARN] app.env 不存在（${env_file}），端口未更新"
+        return 0
+    fi
+
+    local cur_fe cur_be changed=0
+    cur_fe="$(read_env_key NGINX_PORT "${env_file}")"; cur_fe="${cur_fe:-3000}"
+    cur_be="$(read_env_key PORT "${env_file}")"; cur_be="${cur_be:-3001}"
+    # 目标值：填了用填的，没填保持现值；前后端撞号则拒绝
+    local tgt_fe="${fe:-${cur_fe}}" tgt_be="${be:-${cur_be}}"
+    if [ "${tgt_fe}" = "${tgt_be}" ]; then
+        log "[WARN] 前后端端口相同（${tgt_fe}），端口未修改"
+        return 0
+    fi
+    if [ -n "${fe}" ] && _port_valid "${fe}" && [ "${fe}" != "${cur_fe}" ]; then
+        write_env_key "${env_file}" "NGINX_PORT" "${fe}"
+        changed=1
+        log "前端端口已更新：${cur_fe} → ${fe}"
+    fi
+    if [ -n "${be}" ] && _port_valid "${be}" && [ "${be}" != "${cur_be}" ]; then
+        write_env_key "${env_file}" "PORT" "${be}"
+        changed=1
+        log "后端端口已更新：${cur_be} → ${be}"
+    fi
+    [ "${changed}" -eq 0 ] && { log "端口配置与当前值一致，无需更新"; return 0; }
+    chown "${APP_USER}:${APP_GROUP}" "${env_file}" 2>/dev/null || true
+    PORT_CHANGED=1
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# 全量重启应用（端口变更后调用：前后端需重新绑定监听端口）
+#   config_callback 以 root 运行，TRIM_* 环境直接继承；main 在 root 上下文
+#   内部自行降权。免登录凭据变化只需 restart_bridge，不要走这里。
+# --------------------------------------------------------------------------
+restart_app() {
+    local main_script=""
+    local cand
+    for cand in "/var/apps/moviepilot/cmd/main" \
+                "${TRIM_APPDEST%/target}/cmd/main" \
+                "${APP_DEST}/cmd/main"; do
+        if [ -x "${cand}" ]; then
+            main_script="${cand}"
+            break
+        fi
+    done
+    [ -n "${main_script}" ] || {
+        log "[WARN] 未找到可执行的 cmd/main，请手动重启应用"
+        return 0
+    }
+    log "重启应用使新端口生效（stop → start）..."
+    bash "${main_script}" stop >> "${CONFIG_LOG}" 2>&1 || \
+        log "[WARN] stop 返回非零（可能本就没在跑），继续 start"
+    sleep 2
+    bash "${main_script}" start >> "${CONFIG_LOG}" 2>&1 || {
+        log "[ERROR] 应用重启失败，请手动在应用中心启动"
+        return 0
+    }
+    log "应用已重启，新端口已生效"
+}
+
 log "=== 应用配置变更 ==="
 write_fnos_grants
 setup_bridge_autologin
-# 免登录凭据真的变了 → 仅重启网关桥重读凭据（MoviePilot 本体不动）
-[ "${AUTOLOGIN_CHANGED:-0}" = "1" ] && restart_bridge
+setup_ports
+# 端口变了 → 全量重启（桥随 start 一起用新端口）；仅凭据变了 → 秒级重启桥
+if [ "${PORT_CHANGED:-0}" = "1" ]; then
+    restart_app
+elif [ "${AUTOLOGIN_CHANGED:-0}" = "1" ]; then
+    restart_bridge
+fi
 log "=== 配置应用完成 ==="
 exit 0

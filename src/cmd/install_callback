@@ -290,6 +290,44 @@ EOF
 
     ensure_secret_keys
     ensure_direct_env_defaults
+    ensure_wizard_ports
+}
+
+# --------------------------------------------------------------------------
+# 向导端口绑定（wizard_nginx_port / wizard_port）
+#   MP 前端/后端端口经 app.env 的 NGINX_PORT / PORT 配置（上游原生支持，
+#   cmd/main 的桥转发/探活同读这两个键）。仅当向导填了有效端口且与默认值
+#   不同时写入；默认 3000/3001 不写（缺省即上游默认）。前后端相同则拒绝。
+# --------------------------------------------------------------------------
+_port_valid() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+ensure_wizard_ports() {
+    local env_file="${CONFIG_DIR}/app.env"
+    touch "${env_file}"
+    local fe="${wizard_nginx_port:-}" be="${wizard_port:-}"
+    if [ -n "${fe}" ] && [ -n "${be}" ] && [ "${fe}" = "${be}" ]; then
+        log "[WARN] 前后端端口相同（${fe}），忽略端口设置，使用默认 3000/3001"
+        return 0
+    fi
+    if [ -n "${fe}" ] && _port_valid "${fe}" && [ "${fe}" != "3000" ]; then
+        if grep -qE "^[[:space:]]*NGINX_PORT=" "${env_file}"; then
+            sed -i -E "s|^[[:space:]]*NGINX_PORT=.*|NGINX_PORT=${fe}|" "${env_file}"
+        else
+            printf "NGINX_PORT=%s\n" "${fe}" >> "${env_file}"
+        fi
+        log "前端端口已绑定：${fe}"
+    fi
+    if [ -n "${be}" ] && _port_valid "${be}" && [ "${be}" != "3001" ]; then
+        if grep -qE "^[[:space:]]*PORT=" "${env_file}"; then
+            sed -i -E "s|^[[:space:]]*PORT=.*|PORT=${be}|" "${env_file}"
+        else
+            printf "PORT=%s\n" "${be}" >> "${env_file}"
+        fi
+        log "后端端口已绑定：${be}"
+    fi
 }
 
 # --------------------------------------------------------------------------
