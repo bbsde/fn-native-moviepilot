@@ -9,7 +9,8 @@
 #
 # 处理：
 #   1) 网桥免登录账号绑定（wizard_superuser / wizard_password → app.env）
-#   2) 授权目录祖先链浏览可见性（见 sync_browse_visibility）
+#   2) 授权目录清单落盘（见 write_fnos_grants → fnos_grants.txt，
+#      MP 目录浏览器补丁据此在祖先层合成下一跳虚拟目录）
 #
 #   留空语义：wizard 字段留空 = 不修改当前值（保留 app.env 现有内容）。
 #
@@ -175,48 +176,31 @@ restart_bridge() {
 
 
 # --------------------------------------------------------------------------
-# 授权目录祖先链浏览可见性（TRIM_DATA_ACCESSIBLE_PATHS）
-#   fnOS「配置访问权限」对目标目录授读写（trim_acl 内核层生效），但祖先层
-#   仅给穿透（--x）不可列举 → 网页目录浏览器在 /volN 层即无法展开。
-#   此处为每条授权目录的祖先链补 r-x：浏览器可逐级点到授权目录；授权范围
-#   之外的内容依旧不可读。幂等；祖先路径记录至 browse_grants.txt 供卸载回收。
-#   非 root 上下文（异常场景）则跳过，交由下次安装/升级兜底同步。
+# 授权目录清单（TRIM_DATA_ACCESSIBLE_PATHS → fnos_grants.txt）
+#   fnOS trimacl 卷上 posix ACL 不被内核执行，祖先层授不了列举权（setfacl
+#   写得进、不生效）；改由 MP 目录浏览器补丁读取本清单，在祖先层合成
+#   下一跳虚拟目录，逐级展开到授权目录本体（其内为「配置访问权限」原生
+#   读写）。清单缺省（普通配置表单提交）时不动现有文件。幂等：整文件重写。
 # --------------------------------------------------------------------------
-sync_browse_visibility() {
+write_fnos_grants() {
     local dirs="${TRIM_DATA_ACCESSIBLE_PATHS:-}"
-    if [ -z "${dirs}" ]; then
-        return 0
-    fi
-    if [ "$(id -un)" != "root" ]; then
-        log "[WARN] 非特权上下文，浏览层同步跳过（下次安装/升级兜底）"
-        return 0
-    fi
-
-    local config_dir granted_file
+    [ -z "${dirs}" ] && return 0
+    local config_dir grants_file
     config_dir="$(resolve_config_dir 2>/dev/null)" || return 0
-    granted_file="${config_dir}/browse_grants.txt"
-    touch "${granted_file}" 2>/dev/null || return 0
-
-    local d p n=0
+    grants_file="${config_dir}/fnos_grants.txt"
+    : > "${grants_file}" 2>/dev/null || return 0
+    local d
     local IFS=':'
     for d in ${dirs}; do
-        [ -d "${d}" ] || continue
-        p="${d%/}"
-        while [ "${#p}" -gt 1 ]; do
-            p="${p%/*}"
-            [ -z "${p}" ] && p="/"
-            case "${p}" in ""|"/") break ;; esac
-            setfacl -m "u:${APP_USER}:r-x" "${p}" 2>/dev/null || true
-            grep -qxF "${p}" "${granted_file}" 2>/dev/null || echo "${p}" >> "${granted_file}"
-            n=$((n + 1))
-        done
+        [ -d "${d}" ] && echo "${d%/}" >> "${grants_file}"
     done
-    chown "${APP_USER}:${APP_GROUP}" "${granted_file}" 2>/dev/null || true
-    log "授权目录祖先链浏览可见性已同步（${n} 条 r-x）"
+    chown "${APP_USER}:${APP_GROUP}" "${grants_file}" 2>/dev/null || true
+    log "授权目录清单已更新（$(grep -c . "${grants_file}") 条，目录浏览器可逐级展开）"
+    return 0
 }
 
 log "=== 应用配置变更 ==="
-sync_browse_visibility
+write_fnos_grants
 setup_bridge_autologin
 # 免登录凭据真的变了 → 仅重启网关桥重读凭据（MoviePilot 本体不动）
 [ "${AUTOLOGIN_CHANGED:-0}" = "1" ] && restart_bridge

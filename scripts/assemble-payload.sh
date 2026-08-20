@@ -89,8 +89,11 @@ fetch_source() {
 # --------------------------------------------------------------------------
 stage_source() {
     log "释放源码 → ${BUILD}/payload/MoviePilot"
-    rm -rf "${BUILD}/payload"
+    # 清空组装目录。目录本体可能被本机 shell 占为 CWD（Windows 句柄）删不掉，
+    # 退化为清空内容——顶层目录保留不影响后续（tar 释放进既有目录即可）
+    rm -rf "${BUILD}/payload" 2>/dev/null || true
     mkdir -p "${BUILD}/payload/MoviePilot"
+    find "${BUILD}/payload" -mindepth 1 -delete 2>/dev/null || true
     tar -xzf "${SRC_ARCHIVE}" -C "${BUILD}/payload/MoviePilot" --strip-components=1
     [ -f "${BUILD}/payload/MoviePilot/requirements.in" ] || die "源码包缺少 requirements.in（tag 异常？）"
     [ -f "${BUILD}/payload/MoviePilot/scripts/local_setup.py" ] || die "源码包缺少 scripts/local_setup.py"
@@ -266,6 +269,133 @@ PYEOF
         log "已应用 AniList 数据集 GITHUB_PROXY 加速补丁"
     else
         log "上游 anilist 已引用 GITHUB_PROXY（或结构变化），跳过补丁"
+    fi
+
+    # 补丁 5：fnOS 授权目录虚拟浏览。fnOS「配置访问权限」对授权目录本体授
+    # 读写（trimacl 内核层生效），但祖先层仅穿透权（--x）；posix ACL 在
+    # trimacl 卷上不被内核执行，setfacl 开不了祖先层的列举权 → 应用用户在
+    # 网页目录浏览器中永远点不开 /volN 层（iterdir 抛 PermissionError）。
+    # 补丁：LocalStorage.list 捕获列举无权限（不再 500），并在当前目录是
+    # 授权目录的祖先时合成「下一跳」虚拟子目录（授权清单由生命周期脚本维护
+    # 于配置目录 fnos_grants.txt），浏览器得以逐级展开到授权目录本体（其内
+    # 为原生真实读写）。上游重构 list/create_folder（锚点消失）→ 构建 die。
+    if ! grep -q '__fnos_grant_hop' \
+        "${BUILD}/payload/MoviePilot/app/modules/filemanager/storages/local.py"; then
+        (cd "${BUILD}/payload/MoviePilot/app/modules/filemanager/storages" && "${PY}" - <<'PYEOF' || die "fnOS 授权目录虚拟浏览补丁失败"
+import io
+
+path = "local.py"
+src = io.open(path, encoding="utf-8").read()
+if "fn-native-moviepilot 补丁" in src:
+    print("local.py: 已有补丁标记，跳过")
+    raise SystemExit(0)
+
+list_anchor = (
+    "        # 扁历所有目录\n"
+    "        for item in SystemUtils.list_sub_directory(path_obj):\n"
+    "            ret_items.append(self.__get_diritem(item))\n"
+    "\n"
+    "        # 遍历所有文件，不含子目录\n"
+    "        for item in SystemUtils.list_sub_file(path_obj):\n"
+    "            ret_items.append(self.__get_fileitem(item))\n"
+    "        return ret_items\n"
+)
+list_patched = (
+    "        # 扁历所有目录\n"
+    "        try:\n"
+    "            for item in SystemUtils.list_sub_directory(path_obj):\n"
+    "                ret_items.append(self.__get_diritem(item))\n"
+    "\n"
+    "            # 遍历所有文件，不含子目录\n"
+    "            for item in SystemUtils.list_sub_file(path_obj):\n"
+    "                ret_items.append(self.__get_fileitem(item))\n"
+    "        except PermissionError:\n"
+    "            # fn-native-moviepilot 补丁：fnOS trimacl 卷未授权层可穿透不可\n"
+    "            # 列举，不再向上抛 500，交由下方授权目录虚拟浏览补齐\n"
+    "            pass\n"
+    "        # fn-native-moviepilot 补丁：过滤无权限子项（点开即空的浏览噪声）\n"
+    "        ret_items = self.__fnos_filter_accessible(ret_items)\n"
+    "        # fn-native-moviepilot 补丁：授权目录虚拟浏览（祖先层合成下一跳）\n"
+    "        ret_items = self.__fnos_grant_hop(path, ret_items)\n"
+    "        return ret_items\n"
+)
+methods_anchor = "    def create_folder(self, fileitem: _SchemaFileItem, name: str) -> Optional[_SchemaFileItem]:\n"
+methods_patched = '''    def __fnos_filter_accessible(self, items: List[_SchemaFileItem]) -> List[_SchemaFileItem]:
+        """
+        fn-native-moviepilot 补丁：过滤当前应用用户无权访问的子项——
+        无列举权的目录点开即空、无读权的文件不可用，提前隐藏。
+        必须在 __fnos_grant_hop 之前执行：虚拟跳层本身「可穿不可列」，
+        会被本过滤器误杀。
+        """
+        ret = []
+        for it in items:
+            try:
+                if it.type == "dir":
+                    if os.access(it.path, os.R_OK | os.X_OK):
+                        ret.append(it)
+                elif os.access(it.path, os.R_OK):
+                    ret.append(it)
+            except OSError:
+                continue
+        return ret
+
+    def __fnos_granted_roots(self) -> List[str]:
+        """
+        fn-native-moviepilot 补丁：fnOS「配置访问权限」授权目录清单
+        （生命周期脚本维护于配置目录 fnos_grants.txt，一行一个绝对路径）
+        """
+        grants_file = Path(settings.CONFIG_DIR or "") / "fnos_grants.txt"
+        try:
+            return [
+                line.strip()
+                for line in grants_file.read_text(encoding="utf-8").splitlines()
+                if line.strip().startswith("/")
+            ]
+        except OSError:
+            return []
+
+    def __fnos_grant_hop(self, path: str, items: List[_SchemaFileItem]) -> List[_SchemaFileItem]:
+        """
+        fn-native-moviepilot 补丁：当前目录是某授权目录的祖先时，把各授权
+        路径相对当前目录的「下一跳」子目录合成进结果。应用用户在未授权
+        祖先层只有穿透权（fnOS trimacl），真实列举抛 PermissionError，
+        合成项让目录浏览器仍可逐级展开到授权目录本体（其内为原生读写）。
+        """
+        base = (path or "/").rstrip("/") or "/"
+        prefix = "/" if base == "/" else base + "/"
+        existing = {it.path.rstrip("/") for it in items}
+        hops = set()
+        for root in self.__fnos_granted_roots():
+            root = root.rstrip("/")
+            if root.startswith(prefix):
+                hops.add(root[len(prefix):].split("/", 1)[0])
+        for hop in sorted(hops):
+            child = f"{base}/{hop}"
+            if child in existing:
+                continue
+            try:
+                items.append(self.__get_diritem(Path(child)))
+            except OSError:
+                items.append(_SchemaFileItem(
+                    storage=self.schema.value, type="dir",
+                    path=child + "/", name=hop, basename=hop,
+                ))
+        return items
+
+'''
+if list_anchor not in src:
+    raise SystemExit("local.py: list() 遍历锚点未找到，上游结构已变化，需人工复核")
+if methods_anchor not in src:
+    raise SystemExit("local.py: create_folder 锚点未找到，上游结构已变化，需人工复核")
+src = src.replace(list_anchor, list_patched, 1)
+src = src.replace(methods_anchor, methods_patched + methods_anchor, 1)
+io.open(path, "w", encoding="utf-8", newline="").write(src)
+print("local.py: fnOS 授权目录虚拟浏览补丁已应用")
+PYEOF
+)
+        log "已应用 fnOS 授权目录虚拟浏览补丁（目录浏览器可达授权目录）"
+    else
+        log "local.py 已含虚拟浏览补丁（或结构变化），跳过"
     fi
 
     FRONTEND_VERSION="$("${PY}" -c '

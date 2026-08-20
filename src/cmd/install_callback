@@ -385,43 +385,26 @@ cleanup_and_chown() {
 }
 
 # --------------------------------------------------------------------------
-# 授权目录祖先链浏览可见性（精确模式）
-#   fnOS「配置访问权限」对目标目录授读写（trim_acl），但祖先层仅穿透不可
-#   列举 → 网页目录浏览器打不开 /volN 层。两路同步（均幂等）：
-#   ① browse_grants.txt 记录重放（config_callback 的 sync_browse_visibility
-#      维护，含全部祖先路径）——覆盖安装期拿不到授权清单的场景；
-#   ② TRIM_DATA_ACCESSIBLE_PATHS（fnOS 传入的当前授权清单）祖先链补授并记录。
+# 授权目录清单（TRIM_DATA_ACCESSIBLE_PATHS → fnos_grants.txt）
+#   fnOS trimacl 卷上 posix ACL 不被内核执行，祖先层授不了列举权；MP 目录
+#   浏览器经构建期补丁 #5 读取本清单在祖先层合成下一跳虚拟目录。安装上下
+#   文拿不到授权清单时不动文件（授权变更钩子 config_callback 会维护）。
 # --------------------------------------------------------------------------
-grant_browse_visibility() {
-    local app_user="${TRIM_USERNAME:-moviepilot}"
-    local granted_file="${CONFIG_DIR}/browse_grants.txt"
-    touch "${granted_file}" 2>/dev/null || return 0
-    local n=0 p d
-    while IFS= read -r p; do
-        [ -n "${p}" ] && [ -d "${p}" ] || continue
-        setfacl -m "u:${app_user}:r-x" "${p}" 2>/dev/null || true
-        n=$((n + 1))
-    done < "${granted_file}"
-    if [ -n "${TRIM_DATA_ACCESSIBLE_PATHS:-}" ]; then
-        local IFS=':'
-        for d in ${TRIM_DATA_ACCESSIBLE_PATHS}; do
-            [ -d "${d}" ] || continue
-            p="${d%/}"
-            while [ "${#p}" -gt 1 ]; do
-                p="${p%/*}"
-                [ -z "${p}" ] && p="/"
-                case "${p}" in ""|"/") break ;; esac
-                setfacl -m "u:${app_user}:r-x" "${p}" 2>/dev/null || true
-                grep -qxF "${p}" "${granted_file}" 2>/dev/null || echo "${p}" >> "${granted_file}"
-                n=$((n + 1))
-            done
-        done
+write_fnos_grants() {
+    if [ -z "${TRIM_DATA_ACCESSIBLE_PATHS:-}" ]; then
+        log "安装上下文无授权清单，跳过（授权后由配置钩子维护）"
+        return 0
     fi
-    if [ "${n}" -gt 0 ]; then
-        log "授权目录祖先链浏览可见性已同步（${n} 条 r-x）"
-    else
-        log "无授权记录，跳过浏览层同步"
-    fi
+    local grants_file="${CONFIG_DIR}/fnos_grants.txt"
+    : > "${grants_file}" 2>/dev/null || return 0
+    local d
+    local IFS=':'
+    for d in ${TRIM_DATA_ACCESSIBLE_PATHS}; do
+        [ -d "${d}" ] && echo "${d%/}" >> "${grants_file}"
+    done
+    chown "${APP_USER}:${APP_GROUP}" "${grants_file}" 2>/dev/null || true
+    log "授权目录清单已写入（$(grep -c . "${grants_file}") 条）"
+    return 0
 }
 
 # --------------------------------------------------------------------------
@@ -435,7 +418,7 @@ create_venv
 release_kernel
 write_env_config
 run_init
-grant_browse_visibility
+write_fnos_grants
 cleanup_and_chown
 
 log "=== MoviePilot 安装完成（离线，${UPSTREAM_TAG}）==="
