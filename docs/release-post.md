@@ -1,5 +1,7 @@
 # 【应用分享】MoviePilot v3 — 全自动追剧/观影神器，飞牛 fnOS 原生封装版
 
+![MoviePilot for fnOS](https://ghproxy.net/https://raw.githubusercontent.com/bbsde/fn-native-moviepilot/main/src/ICON_256.PNG)
+
 > 基于 [jxxghp/MoviePilot](https://github.com/jxxghp/MoviePilot) v3.0.0，以 fnOS Native 原生进程方式封装。
 > 资源搜索、订阅追更、下载整理、刮削入库、媒体库同步、消息通知，一条龙全自动。
 
