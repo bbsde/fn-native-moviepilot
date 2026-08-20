@@ -3,7 +3,9 @@
 > 基于 [jxxghp/MoviePilot](https://github.com/jxxghp/MoviePilot) v3.0.0，以 fnOS Native 原生进程方式封装。
 > 资源搜索、订阅追更、下载整理、刮削入库、媒体库同步、消息通知，一条龙全自动。
 
-![MoviePilot](screenshots/01-dashboard.png)
+![MoviePilot 仪表盘](https://ghproxy.net/https://raw.githubusercontent.com/bbsde/fn-native-moviepilot/main/docs/demo.png)
+
+> 仪表盘：媒体统计 · 整理记录 · 后台任务 · 快捷操作
 
 ## 一句话介绍
 

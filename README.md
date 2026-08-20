@@ -16,6 +16,11 @@
 
 [MoviePilot](https://github.com/jxxghp/MoviePilot) 是广受欢迎的自动化媒体管理工具；本项目把它以 **fnOS Native 原生进程**方式带到飞牛 NAS 上——非 Docker、非虚拟机，安装即用。订阅想看的剧集电影，剩下的搜索、下载、识别改名、刮削海报、入库、通知，全部自动完成。
 
+<p align="center">
+  <img src="docs/demo.png" alt="MoviePilot for fnOS 仪表盘" width="860" />
+</p>
+<p align="center"><sub>仪表盘：媒体统计 · 整理记录 · 后台任务 · 快捷操作</sub></p>
+
 ## 特性亮点
 
 **📦 自包含离线安装**
