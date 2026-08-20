@@ -47,7 +47,7 @@
 
 **🐱 飞牛深度整合**
 
-- 桌面图标打开**自动免登录**直进管理界面（局域网直连 3000 端口仍可手动登录）
+- 桌面图标打开**自动免登录**直进管理界面（局域网直连前端端口仍可手动登录，默认 3000，向导可改）
 - 自带**飞牛影视**媒体服务器对接，整理完成的媒体自动同步媒体库（也支持 Emby / Jellyfin / Plex）
 - 配置与数据落在共享区，文件管理器可直接查看管理
 
@@ -57,8 +57,8 @@
 
 | 架构 | 直连下载 | 加速下载（国内推荐） |
 | --- | --- | --- |
-| x86 | [moviepilot_3.0.0.9_x86.fpk](https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.9/moviepilot_3.0.0.9_x86.fpk) | [ghproxy.net](https://ghproxy.net/https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.9/moviepilot_3.0.0.9_x86.fpk) |
-| arm | [moviepilot_3.0.0.9_arm.fpk](https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.9/moviepilot_3.0.0.9_arm.fpk) | [ghproxy.net](https://ghproxy.net/https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.9/moviepilot_3.0.0.9_arm.fpk) |
+| x86 | [moviepilot_3.0.0.14_x86.fpk](https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.14/moviepilot_3.0.0.14_x86.fpk) | [ghproxy.net](https://ghproxy.net/https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.14/moviepilot_3.0.0.14_x86.fpk) |
+| arm | [moviepilot_3.0.0.14_arm.fpk](https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.14/moviepilot_3.0.0.14_arm.fpk) | [ghproxy.net](https://ghproxy.net/https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.14/moviepilot_3.0.0.14_arm.fpk) |
 
 > 加速前缀为公共镜像，失效时可直连或自行更换前缀；Release 附带 `.sha256` 校验值。
 > 系统要求：fnOS ≥ 1.1.3100；依赖 nodejs_v24 运行时，安装时自动拉取。

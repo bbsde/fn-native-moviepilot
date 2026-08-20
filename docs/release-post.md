@@ -54,8 +54,8 @@
 
 | 架构 | 直连下载 | 加速下载（国内推荐） |
 |---|---|---|
-| x86 | [moviepilot_3.0.0.9_x86.fpk](https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.9/moviepilot_3.0.0.9_x86.fpk) | [ghproxy.net 加速](https://ghproxy.net/https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.9/moviepilot_3.0.0.9_x86.fpk) |
-| arm | [moviepilot_3.0.0.9_arm.fpk](https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.9/moviepilot_3.0.0.9_arm.fpk) | [ghproxy.net 加速](https://ghproxy.net/https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.9/moviepilot_3.0.0.9_arm.fpk) |
+| x86 | [moviepilot_3.0.0.14_x86.fpk](https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.14/moviepilot_3.0.0.14_x86.fpk) | [ghproxy.net 加速](https://ghproxy.net/https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.14/moviepilot_3.0.0.14_x86.fpk) |
+| arm | [moviepilot_3.0.0.14_arm.fpk](https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.14/moviepilot_3.0.0.14_arm.fpk) | [ghproxy.net 加速](https://ghproxy.net/https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.14/moviepilot_3.0.0.14_arm.fpk) |
 
 > 加速前缀使用公共镜像 ghproxy.net，失效时可直连或自行更换前缀；Release 内附带 `.sha256` 校验值，下载后建议核对。
 
@@ -113,6 +113,11 @@ Bangumi/GitHub 加速均为第三方公共服务，只经手公开的元数据�
 | 3.0.0.7 | AniList 中文数据集加速，首访提速 |
 | 3.0.0.8 | 构建补丁锚点加固（无行为变化） |
 | 3.0.0.9 | 应用图标更新；移除配置面板自动更新开关，在线自更新彻底关闭 |
+| 3.0.0.10 | 目录授权对接「配置访问权限」（方案演进） |
+| 3.0.0.11 | 生命周期提权 root + 服务降权 moviepilot；授权目录祖先链实时同步 |
+| 3.0.0.12 | 修复启动失败（网关桥竞态）；桥 setpriv 降权；免登录凭据按需生效 |
+| 3.0.0.13 | 目录浏览器虚拟路径：授权目录逐级可见，无权限内容自动过滤 |
+| 3.0.0.14 | 安装/配置向导支持自定义前后端端口（解决端口冲突） |
 
 ## 致谢
 
