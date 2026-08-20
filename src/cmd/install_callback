@@ -385,6 +385,46 @@ cleanup_and_chown() {
 }
 
 # --------------------------------------------------------------------------
+# 授权目录祖先链浏览可见性（精确模式）
+#   fnOS「配置访问权限」对目标目录授读写（trim_acl），但祖先层仅穿透不可
+#   列举 → 网页目录浏览器打不开 /volN 层。两路同步（均幂等）：
+#   ① browse_grants.txt 记录重放（config_callback 的 sync_browse_visibility
+#      维护，含全部祖先路径）——覆盖安装期拿不到授权清单的场景；
+#   ② TRIM_DATA_ACCESSIBLE_PATHS（fnOS 传入的当前授权清单）祖先链补授并记录。
+# --------------------------------------------------------------------------
+grant_browse_visibility() {
+    local app_user="${TRIM_USERNAME:-moviepilot}"
+    local granted_file="${CONFIG_DIR}/browse_grants.txt"
+    touch "${granted_file}" 2>/dev/null || return 0
+    local n=0 p d
+    while IFS= read -r p; do
+        [ -n "${p}" ] && [ -d "${p}" ] || continue
+        setfacl -m "u:${app_user}:r-x" "${p}" 2>/dev/null || true
+        n=$((n + 1))
+    done < "${granted_file}"
+    if [ -n "${TRIM_DATA_ACCESSIBLE_PATHS:-}" ]; then
+        local IFS=':'
+        for d in ${TRIM_DATA_ACCESSIBLE_PATHS}; do
+            [ -d "${d}" ] || continue
+            p="${d%/}"
+            while [ "${#p}" -gt 1 ]; do
+                p="${p%/*}"
+                [ -z "${p}" ] && p="/"
+                case "${p}" in ""|"/") break ;; esac
+                setfacl -m "u:${app_user}:r-x" "${p}" 2>/dev/null || true
+                grep -qxF "${p}" "${granted_file}" 2>/dev/null || echo "${p}" >> "${granted_file}"
+                n=$((n + 1))
+            done
+        done
+    fi
+    if [ "${n}" -gt 0 ]; then
+        log "授权目录祖先链浏览可见性已同步（${n} 条 r-x）"
+    else
+        log "无授权记录，跳过浏览层同步"
+    fi
+}
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 mkdir -p "${DATA_DIR}"
@@ -395,6 +435,7 @@ create_venv
 release_kernel
 write_env_config
 run_init
+grant_browse_visibility
 cleanup_and_chown
 
 log "=== MoviePilot 安装完成（离线，${UPSTREAM_TAG}）==="

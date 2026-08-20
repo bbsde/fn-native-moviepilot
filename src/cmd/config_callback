@@ -1,22 +1,17 @@
 #!/bin/bash
 #
-# config_callback — 用户在应用设置页提交配置后调用（root 身份）
+# config_callback — 配置变更后调用（privilege run-as: root 下为 root 身份）
 #
-# 处理：网桥免登录账号绑定（wizard_superuser / wizard_password）
-#   用户在应用设置页（wizard/config 向导）填入的账号密码，写入 app.env 的
-#   SUPERUSER / SUPERUSER_PASSWORD。网关桥（gateway-bridge.js）启动时读这两个
-#   字段，用它走 /api/v1/login/access-token 换 JWT，注入前端 SPA 实现免登录。
+# 触发源（trim_app_center，实测两种）：
+#   1) 应用设置面板提交（wizard/config 表单值以 wizard_* 环境变量传入）
+#   2) 「配置访问权限」变更——授权清单以 TRIM_DATA_ACCESSIBLE_PATHS（冒号
+#      分隔）传入，config_init 拿旧值、config_callback 拿新值
 #
-#   场景：用户在 MoviePilot 网页改了密码后，需在此同步更新免登录密码，否则
-#   桥用旧密码登录失败，免登录降级为手动登录。
-#
-#   目录访问授权不在此处理：使用 fnOS 应用设置自带的「配置访问权限」
-#   （原生入口，按目录为应用用户授 ACL）。
+# 处理：
+#   1) 网桥免登录账号绑定（wizard_superuser / wizard_password → app.env）
+#   2) 授权目录祖先链浏览可见性（见 sync_browse_visibility）
 #
 #   留空语义：wizard 字段留空 = 不修改当前值（保留 app.env 现有内容）。
-#
-# 幂等：重复执行不破坏数据。仅在字段非空时才写 app.env。
-# 改完后重启应用：让桥重新读凭据 + 用新密码登录。
 
 set -uo pipefail
 
@@ -175,7 +170,49 @@ restart_app() {
 # cmd/main 启动时无条件强制 MOVIEPILOT_AUTO_UPDATE=false（含网页内勾选）。
 
 
+# --------------------------------------------------------------------------
+# 授权目录祖先链浏览可见性（TRIM_DATA_ACCESSIBLE_PATHS）
+#   fnOS「配置访问权限」对目标目录授读写（trim_acl 内核层生效），但祖先层
+#   仅给穿透（--x）不可列举 → 网页目录浏览器在 /volN 层即无法展开。
+#   此处为每条授权目录的祖先链补 r-x：浏览器可逐级点到授权目录；授权范围
+#   之外的内容依旧不可读。幂等；祖先路径记录至 browse_grants.txt 供卸载回收。
+#   非 root 上下文（异常场景）则跳过，交由下次安装/升级兜底同步。
+# --------------------------------------------------------------------------
+sync_browse_visibility() {
+    local dirs="${TRIM_DATA_ACCESSIBLE_PATHS:-}"
+    if [ -z "${dirs}" ]; then
+        return 0
+    fi
+    if [ "$(id -un)" != "root" ]; then
+        log "[WARN] 非特权上下文，浏览层同步跳过（下次安装/升级兜底）"
+        return 0
+    fi
+
+    local config_dir granted_file
+    config_dir="$(resolve_config_dir 2>/dev/null)" || return 0
+    granted_file="${config_dir}/browse_grants.txt"
+    touch "${granted_file}" 2>/dev/null || return 0
+
+    local d p n=0
+    local IFS=':'
+    for d in ${dirs}; do
+        [ -d "${d}" ] || continue
+        p="${d%/}"
+        while [ "${#p}" -gt 1 ]; do
+            p="${p%/*}"
+            [ -z "${p}" ] && p="/"
+            case "${p}" in ""|"/") break ;; esac
+            setfacl -m "u:${APP_USER}:r-x" "${p}" 2>/dev/null || true
+            grep -qxF "${p}" "${granted_file}" 2>/dev/null || echo "${p}" >> "${granted_file}"
+            n=$((n + 1))
+        done
+    done
+    chown "${APP_USER}:${APP_GROUP}" "${granted_file}" 2>/dev/null || true
+    log "授权目录祖先链浏览可见性已同步（${n} 条 r-x）"
+}
+
 log "=== 应用配置变更 ==="
+sync_browse_visibility
 setup_bridge_autologin
 # 配置改了 app.env → 重启让后端/桥重读
 if [ -n "${wizard_superuser:-}${wizard_password:-}" ]; then

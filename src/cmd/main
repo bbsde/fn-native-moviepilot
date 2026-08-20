@@ -12,11 +12,14 @@
 # stop  流程：先停 gateway-bridge，再 moviepilot stop。
 # status：前端 :3000 与 gateway socket 双就绪才算运行中。
 #
-# 运行身份：moviepilot 用户（run-as: package）
+# 运行身份（privilege run-as: root）：本脚本以 root 运行，负责特权准备；
+# 服务进程（MoviePilot 前后端、网关桥）一律经 AS_APP_USER 降权到 moviepilot
+# 用户执行（fnOS 推荐姿势：长期对外服务保持非特权）。
 
 set -uo pipefail
 
 MP_ROOT="${TRIM_PKGVAR}/MoviePilot"
+APP_USER="${TRIM_USERNAME:-moviepilot}"
 # Node 运行时：fnOS 应用中心依赖 nodejs_v24（manifest install_dep_apps 声明）
 NODE_RUNTIME_BIN="/var/apps/nodejs_v24/target/bin"
 INSTALL_LOG="${TRIM_PKGVAR}/info.log"
@@ -76,6 +79,25 @@ read_env_key() {
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "${INSTALL_LOG}" 2>/dev/null
+}
+
+# --------------------------------------------------------------------------
+# 降权执行：root 上下文里以应用用户运行命令；已是应用用户则直接执行。
+# 传给服务进程的环境与 prepare_env 保持一致（CONFIG_DIR/PATH/HOME/
+# CLOAKBROWSER_CACHE_DIR/MOVIEPILOT_AUTO_UPDATE）。
+# --------------------------------------------------------------------------
+AS_APP_USER() {
+    if [ "$(id -un)" = "root" ]; then
+        runuser -u "${APP_USER}" -- env \
+            CONFIG_DIR="${CONFIG_DIR}" \
+            PATH="${PATH}" \
+            HOME="${HOME}" \
+            CLOAKBROWSER_CACHE_DIR="${CLOAKBROWSER_CACHE_DIR}" \
+            MOVIEPILOT_AUTO_UPDATE="${MOVIEPILOT_AUTO_UPDATE}" \
+            "$@"
+    else
+        "$@"
+    fi
 }
 
 # --------------------------------------------------------------------------
@@ -200,15 +222,30 @@ start_gateway_bridge() {
         log_msg "Starting gateway-bridge (autologin=off, app.env 缺少凭据) ..."
     fi
 
-    GATEWAY_PREFIX="${GATEWAY_PREFIX}" \
-    LISTEN_SOCKET="${GATEWAY_SOCK}" \
-    UPSTREAM_HOST="127.0.0.1" UPSTREAM_PORT="3000" \
-    BRIDGE_LOGIN_USER="${login_user}" \
-    BRIDGE_LOGIN_PASS="${login_pass}" \
-    BRIDGE_LOG="${GATEWAY_LOG}" \
-      nohup "${NODE_RUNTIME_BIN}/node" "${GATEWAY_BRIDGE}" >> "${GATEWAY_LOG}" 2>&1 &
-    local pid=$!
-    echo "${pid}" > "${GATEWAY_PID}"
+    # 降权启动桥：root 时经 runuser 以 moviepilot 运行 node；
+    # 内层 bash 先把自身 pid（exec 后即 node 的 pid）写入 pid 文件再 exec，
+    # 保证 pid 文件记录的是 node 本体（stop 才能精准 kill，而非 runuser 包装进程）。
+    if [ "$(id -un)" = "root" ]; then
+        runuser -u "${APP_USER}" -- env \
+            GATEWAY_PREFIX="${GATEWAY_PREFIX}" \
+            LISTEN_SOCKET="${GATEWAY_SOCK}" \
+            UPSTREAM_HOST="127.0.0.1" UPSTREAM_PORT="3000" \
+            BRIDGE_LOGIN_USER="${login_user}" \
+            BRIDGE_LOGIN_PASS="${login_pass}" \
+            GATEWAY_LOG="${GATEWAY_LOG}" \
+            bash -c 'echo $$ > "'"${GATEWAY_PID}"'" && exec nohup "'"${NODE_RUNTIME_BIN}/node"'" "'"${GATEWAY_BRIDGE}"'" >> "'"${GATEWAY_LOG}"'" 2>&1' &
+    else
+        GATEWAY_PREFIX="${GATEWAY_PREFIX}" \
+        LISTEN_SOCKET="${GATEWAY_SOCK}" \
+        UPSTREAM_HOST="127.0.0.1" UPSTREAM_PORT="3000" \
+        BRIDGE_LOGIN_USER="${login_user}" \
+        BRIDGE_LOGIN_PASS="${login_pass}" \
+        GATEWAY_LOG="${GATEWAY_LOG}" \
+          nohup "${NODE_RUNTIME_BIN}/node" "${GATEWAY_BRIDGE}" >> "${GATEWAY_LOG}" 2>&1 &
+        echo "$!" > "${GATEWAY_PID}"
+    fi
+    local pid
+    pid="$(cat "${GATEWAY_PID}" 2>/dev/null)"
     # 等待 socket 出现（桥内部会先等前端就绪再 listen，给足时间）
     local i
     for ((i = 0; i < 60; i++)); do
@@ -258,8 +295,8 @@ do_start() {
     fi
 
     log_msg "Starting MoviePilot ..."
-    # CLI spawn 后端+前端为分离进程，健康检查通过后返回 0
-    if ./moviepilot start --timeout 120 >> "${INSTALL_LOG}" 2>&1; then
+    # CLI spawn 后端+前端为分离进程，健康检查通过后返回 0（降权运行）
+    if AS_APP_USER ./moviepilot start --timeout 120 >> "${INSTALL_LOG}" 2>&1; then
         log_msg "MoviePilot started (frontend :3000, backend :3001)"
     else
         log_msg "[ERROR] MoviePilot start failed"
@@ -271,7 +308,7 @@ do_start() {
         echo "网关桥启动失败，详见 ${GATEWAY_LOG}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
         # 回滚：停掉已启动的 MoviePilot，避免半启动状态（MP 在跑但网关入口不可用）
         log_msg "[ROLLBACK] 网关桥失败，停止 MoviePilot ..."
-        ./moviepilot stop --timeout 30 --force >> "${INSTALL_LOG}" 2>&1 || true
+        AS_APP_USER ./moviepilot stop --timeout 30 --force >> "${INSTALL_LOG}" 2>&1 || true
         return 1
     fi
     return 0
@@ -285,7 +322,7 @@ do_stop() {
     # moviepilot stop 先优雅停（SIGTERM + 30s）。
     # --force 兜底：超时未退则 SIGKILL。不 force 的话，30s 没退会抛异常退出，
     # 进程仍在跑占着端口，下次 start 报 "running-unmanaged"。
-    ./moviepilot stop --timeout 30 --force >> "${INSTALL_LOG}" 2>&1
+    AS_APP_USER ./moviepilot stop --timeout 30 --force >> "${INSTALL_LOG}" 2>&1
     local rc=$?
 
     # 即使 moviepilot stop 返回成功，也要确认端口真正释放：

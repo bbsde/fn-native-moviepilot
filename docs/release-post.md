@@ -1,4 +1,4 @@
-# 【应用分享】MoviePilot v3 — 全自动追剧/观影神器，飞牛 fnOS 原生封装版
+# 【应用分享】MoviePilot v3 — 全自动追剧/观影神器，飞牛原生封装版
 
 ![MoviePilot for fnOS](https://ghproxy.net/https://raw.githubusercontent.com/bbsde/fn-native-moviepilot/main/src/app/ui/images/icon_64.png)
 
@@ -69,7 +69,7 @@
 
 ## 首次配置建议
 
-1. **目录授权**：fnOS 应用设置 → MoviePilot →「配置访问权限」，勾选媒体库、下载目录。MoviePilot 以专用应用用户运行，未授权的目录无法浏览和读写
+1. **目录授权**：fnOS 应用设置 → MoviePilot →「配置访问权限」，勾选媒体库、下载目录（授权即时生效，无需重启）。MoviePilot 以专用应用用户运行，未授权的目录无法浏览和读写
 2. **设定 → 服务**：添加下载器（qBittorrent/Transmission 等）
 3. **设定 → 媒体服务器**：添加媒体服务器，飞牛影视地址填 `http://你的NAS_IP:5666`，账号密码为 fnOS 登录账号
 4. **设定 → 站点**：导入站点认证资源（支持 CookieCloud 同步）
@@ -87,7 +87,7 @@
 不会。配置、数据库、账号都在共享区，覆盖升级原样保留。
 
 **Q：添加目录时 /vol1、/vol2 下的目录读不出来？**
-应用以专用用户运行，默认无权访问用户共享目录。fnOS 应用设置 → MoviePilot →「配置访问权限」勾选需要的目录即可。
+应用以专用用户运行，默认无权访问用户共享目录。fnOS 应用设置 → MoviePilot →「配置访问权限」勾选需要的目录即可，授权即时生效。
 
 **Q：在 MoviePilot 网页里改了密码，桌面图标打开不进去了？**
 应用中心 → MoviePilot → 设置，在「网桥免登录账号」里同步填一次新密码即可。

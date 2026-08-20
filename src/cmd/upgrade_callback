@@ -223,6 +223,39 @@ find "${DATA_DIR}" -xtype l -delete 2>/dev/null || true
 chown -R "${APP_USER}:${APP_GROUP}" "${DATA_DIR}" 2>/dev/null || \
     log "[WARN] chown ${DATA_DIR} 失败（可能权限受限）"
 
+# 7. 授权目录祖先链浏览可见性同步（记录重放 + 当前授权清单；幂等，
+#    逻辑同 install_callback 的 grant_browse_visibility）
+if [ -n "${CONFIG_DIR}" ] && [ -f "${CONFIG_DIR}/browse_grants.txt" ]; then
+    _n=0
+    while IFS= read -r _p; do
+        [ -n "${_p}" ] && [ -d "${_p}" ] || continue
+        setfacl -m "u:${APP_USER}:r-x" "${_p}" 2>/dev/null || true
+        _n=$((_n + 1))
+    done < "${CONFIG_DIR}/browse_grants.txt"
+    [ "${_n}" -gt 0 ] && log "浏览层记录重放完成（${_n} 条 r-x）"
+fi
+if [ -n "${TRIM_DATA_ACCESSIBLE_PATHS:-}" ]; then
+    _gf="${CONFIG_DIR}/browse_grants.txt"
+    touch "${_gf}" 2>/dev/null || true
+    _n2=0
+    _ifs_old="${IFS}"
+    IFS=':'
+    for _d in ${TRIM_DATA_ACCESSIBLE_PATHS}; do
+        [ -d "${_d}" ] || continue
+        _p="${_d%/}"
+        while [ "${#_p}" -gt 1 ]; do
+            _p="${_p%/*}"
+            [ -z "${_p}" ] && _p="/"
+            case "${_p}" in ""|"/") break ;; esac
+            setfacl -m "u:${APP_USER}:r-x" "${_p}" 2>/dev/null || true
+            grep -qxF "${_p}" "${_gf}" 2>/dev/null || echo "${_p}" >> "${_gf}"
+            _n2=$((_n2 + 1))
+        done
+    done
+    IFS="${_ifs_old}"
+    [ "${_n2}" -gt 0 ] && log "授权清单祖先链已同步（${_n2} 条 r-x）"
+fi
+
 log "=== fpk 升级完成（${UPSTREAM_TAG:-payload 未变更}）==="
 log "（应用更新唯一通道 = 安装新版 fpk；MoviePilot 网页内更新入口已停用）"
 exit 0
