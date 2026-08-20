@@ -156,33 +156,14 @@ restart_app() {
     log "应用已重启，配置已生效"
 }
 
-# --------------------------------------------------------------------------
-# 自动更新开关（wizard_auto_update：true/false）
-#   写入 app.env 的 MOVIEPILOT_AUTO_UPDATE，cmd/main start 时读取决定是否自动更新。
-#   留空（向导未填）= 不修改当前值。
-# --------------------------------------------------------------------------
-setup_auto_update() {
-    local val="${wizard_auto_update:-}"
-    [ -z "${val}" ] && { log "自动更新未修改（留空），跳过"; return 0; }
-
-    local config_dir env_file
-    config_dir="$(resolve_config_dir 2>/dev/null)" || {
-        log "[WARN] 无法定位 config 目录，自动更新设置未保存"
-        return 0
-    }
-    env_file="${config_dir}/app.env"
-    [ -f "${env_file}" ] || { log "[WARN] app.env 不存在，自动更新设置未保存"; return 0; }
-
-    write_env_key "${env_file}" "MOVIEPILOT_AUTO_UPDATE" "${val}"
-    chown "${APP_USER}:${APP_GROUP}" "${env_file}" 2>/dev/null || true
-    log "自动更新已设置为：${val}"
-}
+# 自动更新开关已随 v3 打包设计移除：在线更新会用上游原版文件覆盖构建期补丁，
+# 且 venv 依赖按 payload.lock 装配、与新版源码脱钩。唯一更新通道 = 安装新 fpk；
+# cmd/main 启动时无条件强制 MOVIEPILOT_AUTO_UPDATE=false（含网页内勾选）。
 
 log "=== 应用配置变更 ==="
 setup_bridge_autologin
-setup_auto_update
-# 任一配置改了 app.env → 重启让后端/桥重读
-if [ -n "${wizard_superuser:-}${wizard_password:-}${wizard_auto_update:-}" ]; then
+# 配置改了 app.env → 重启让后端/桥重读
+if [ -n "${wizard_superuser:-}${wizard_password:-}" ]; then
     restart_app
 fi
 log "=== 配置应用完成 ==="

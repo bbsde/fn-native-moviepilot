@@ -163,17 +163,13 @@ prepare_env() {
     # 否则运行时 cloakbrowser 会再次尝试下载内核到不存在的 /home/<user>。
     export HOME="${TRIM_PKGHOME:-${TRIM_PKGVAR}}"
     export CLOAKBROWSER_CACHE_DIR="${TRIM_PKGVAR}/cloakbrowser-cache"
-    # 自动更新：v3 打包为源码快照（非 git），网页内更新已无意义且默认会联网，
-    # 默认关死。app.env 有值时以它为准（保持语义：设置优先于默认）。
-    local auto_update
-    auto_update="$(read_env_key MOVIEPILOT_AUTO_UPDATE 2>/dev/null)"
-    if [ -n "${auto_update}" ]; then
-        export MOVIEPILOT_AUTO_UPDATE="${auto_update}"
-        log_msg "自动更新：MOVIEPILOT_AUTO_UPDATE=${auto_update}（app.env）"
-    else
-        export MOVIEPILOT_AUTO_UPDATE=false
-        log_msg "自动更新：MOVIEPILOT_AUTO_UPDATE=false（app.env 未设置，用默认）"
-    fi
+    # 自动更新：无条件关死，app.env 有值也忽略。在线更新会用上游原版文件
+    # 覆盖源码——构建期补丁（module_manager 热重建 / Bangumi 域名 / AniList
+    # 数据集加速）被静默回退，且 venv 依赖按 payload.lock 装配、与新版源码
+    # 脱钩会运行时崩溃。唯一更新通道 = 安装新 fpk（向导/面板中的开关已移除，
+    # MoviePilot 网页设置里的自动更新勾选框也因此失效——见向导提示文案）。
+    export MOVIEPILOT_AUTO_UPDATE=false
+    log_msg "自动更新：MOVIEPILOT_AUTO_UPDATE=false（强制关闭，更新通道=安装新 fpk）"
     cd "${MP_ROOT}" || exit 1
 }
 

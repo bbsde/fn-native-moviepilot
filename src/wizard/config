@@ -7,6 +7,10 @@
                 "helpText": "fnOS 桌面通过应用图标打开 MoviePilot 时自动以该账号免登录。局域网直连 3000 端口仍需手动登录。<br><b>此密码需与 MoviePilot 网页内该账号的实际密码保持一致</b>——若你在 MoviePilot 网页里改过密码，需在此同步更新，否则免登录会失效。<br>留空表示不修改当前值。"
             },
             {
+                "type": "tips",
+                "helpText": "应用更新方式：下载安装新版 fpk 覆盖升级。自动更新已停用——在线更新会覆盖打包内补丁并使依赖脱钩。"
+            },
+            {
                 "type": "text",
                 "field": "wizard_superuser",
                 "label": "免登录用户名",
@@ -19,22 +23,6 @@
                 "label": "免登录密码",
                 "rules": [{ "min": 8, "message": "密码至少 8 位" }],
                 "helpText": "对应用户在 MoviePilot 中的实际登录密码。留空表示不修改。修改后自动重启应用生效。"
-            }
-        ]
-    },
-    {
-        "stepTitle": "自动更新",
-        "items": [
-            {
-                "type": "radio",
-                "field": "wizard_auto_update",
-                "label": "启动时自动检查更新",
-                "initValue": "",
-                "options": [
-                    { "label": "开启", "value": "true" },
-                    { "label": "关闭", "value": "false" }
-                ],
-                "helpText": "每次启动检查并拉取最新版本（走国内镜像加速，约 2 分钟完成）。关闭后需在 MoviePilot 网页手动点更新。留空表示不修改当前设置。修改后自动重启生效。"
             }
         ]
     }
