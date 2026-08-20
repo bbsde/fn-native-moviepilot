@@ -463,14 +463,36 @@ fetch_wheels() {
                 "${PY}" -m pip wheel "${req}" --no-deps -w "${wtmp}" \
                     || die "本地构建 wheel 失败：${req}"
                 local w w_base plat
+                local host_arch=""
+                if [ "$(uname -s)" = "Linux" ]; then
+                    case "$(uname -m)" in
+                        x86_64|amd64)  host_arch="x86_64" ;;
+                        aarch64|arm64) host_arch="aarch64" ;;
+                    esac
+                fi
                 for w in "${wtmp}"/*.whl; do
                     w_base="$(basename "${w}" .whl)"
                     plat="${w_base##*-}"
                     if [ "${plat}" = "any" ]; then
                         mv -f "${w}" "${wheel_cache}/"
                         log "    纯 Python wheel：$(basename "${w}")"
+                    elif [ "${host_arch}" = "${ARCH}" ]; then
+                        # 本机架构与目标一致的 Linux 主机（CI 原生腿）：原生构建出的
+                        # linux_<arch> / manylinux*_<arch> 轮就是设备可直接使用的产物
+                        # （ubuntu x86_64 构 crcmod 得 linux_x86_64 轮、arm64 腿得
+                        # linux_aarch64 轮）。无编译器的 Windows 本机 pip 会静默降级
+                        # 纯 Python 构建，自然走上面的 any 分支——本地与 CI 两条路都通。
+                        case "${plat}" in
+                            linux_${ARCH}|manylinux*_${ARCH})
+                                mv -f "${w}" "${wheel_cache}/"
+                                log "    原生 C 扩展 wheel：$(basename "${w}")"
+                                ;;
+                            *)
+                                die "${req} 构建出的 wheel 平台标签异常：${plat}（目标 ${ARCH}）"
+                                ;;
+                        esac
                     else
-                        die "${req} 为 C 扩展 sdist-only，本机无法跨平台构建 ${ARCH} wheel（请在 Linux CI 腿构建或容器内 manylinux 化）"
+                        die "${req} 为 C 扩展 sdist-only，本机（$(uname -m)）无法构建 ${ARCH} wheel（请在对应架构的 Linux CI 腿构建，或容器内 manylinux 化）"
                     fi
                 done
                 rm -rf "${wtmp}"
