@@ -19,3 +19,7 @@ develop/MoviePilot-Frontend/
 
 # 日志
 *.log
+
+# AI 助手指令文件（仅本地使用，不入库）
+AGENTS.md
+CLAUDE.md
