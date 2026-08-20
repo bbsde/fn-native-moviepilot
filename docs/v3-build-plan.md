@@ -246,3 +246,5 @@ v3 分支（新建，唯一活跃）：
 | MSYS(noacl) 执行位 | Windows 构建机 chmod 对 ELF 无效（仅 shebang 文件自动获得执行位），内核 chrome 进 tar 变 644 | 内核树打包 `tar --mode=755` 强制统一模式 + 内层 tar 断言；moviepilot wrapper 靠 shebang 特性天然带 rwx，同样有断言兜底 |
 | 原生 Windows 工具不认 MSYS 路径 | python/uv 收到 `/d/...` 路径直接 FileNotFoundError | 所有 python/uv 调用一律「cd + 相对路径」 |
 | lock 先写会被误判缓存完整 | 解析产物先落盘，下载中断后重跑命中「已缓存」跳过 | lock 先写 `lock.staging`，下载闭包完整后才转正 |
+| 上游 v3.0.0 init 缺陷 | `local_setup.py:2504` 引用不存在的 `app.application.security.access`（实际在 `security.token`），`init --superuser` 必炸（Docker 用户不跑 local_setup 故上游未察觉） | 构建期 sed 修正（stage_source 内，上游修复后自动失效） |
+| appcenter 上下文 venv 静默失败 | appcenter 安装环境里 `python3 -m venv` 两种模式均无输出失败（手动 root / moviepilot 用户 / 精简 PATH 均正常，成因未明） | venv 三级兜底：标准 → `--without-pip` → **手工构建**（pyvenv.cfg + bin/python 链接，不依赖 venv 模块）；手工路径已在真机验证；失败时记录 user/HOME/TMPDIR/PATH 快照 |
