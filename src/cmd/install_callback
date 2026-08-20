@@ -300,12 +300,16 @@ EOF
 # - raw.githubusercontent.com 直连间歇性重置（4 测 2 断）→ 插件市场时好时坏；
 #   ghproxy.net 为实测最快的可用加速镜像（镜像有生命周期，失效后可在
 #   设定→高级设置→网络 中清除或更换，MP 会自动回退直连策略）。
+# - api.bgm.tv 被 DNS 污染 + SNI 重置双重封锁，无镜像则 Bangumi 数据源全断；
+#   api.bangumi.lol（Mirrox 开源反代）实测直连可用且自动改写图片域（需配合
+#   构建期「Bangumi API 域名可配置」补丁）。第三方镜像可见查询内容，介意者
+#   可在 app.env 中改回 api.bgm.tv（需梯子）。
 # --------------------------------------------------------------------------
 ensure_direct_env_defaults() {
     local env_file="${CONFIG_DIR}/app.env"
     touch "${env_file}"
     local kv key val
-    for kv in "TMDB_API_DOMAIN=api.tmdb.org" "GITHUB_PROXY=https://ghproxy.net/"; do
+    for kv in "TMDB_API_DOMAIN=api.tmdb.org" "GITHUB_PROXY=https://ghproxy.net/" "BANGUMI_API_DOMAIN=api.bangumi.lol"; do
         key="${kv%%=*}" val="${kv#*=}"
         if grep -qE "^[[:space:]]*${key}=" "${env_file}"; then
             log "${key} 已有配置，保持不变"

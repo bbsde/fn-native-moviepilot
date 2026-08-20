@@ -143,6 +143,75 @@ PYEOF
         log "module_manager 锚点不存在（上游已修复或重构），跳过补丁"
     fi
 
+    # 补丁 3：Bangumi API 域名可配置。上游硬编码 https://api.bgm.tv/，
+    # 该域名在国内被 DNS 污染 + SNI 重置双重封锁（裸 TCP 通、ClientHello 带
+    # SNI 即 RST），无梯子不可用；社区镜像（如 api.bangumi.lol，Mirrox 项目）
+    # 国内直连可用且自动改写返回 JSON 中的图片域。补丁新增 BANGUMI_API_DOMAIN
+    # 配置（默认仍官方域名），三处引用同步改造。上游若自行支持则锚点消失自动停用。
+    if ! grep -q 'BANGUMI_API_DOMAIN' \
+        "${BUILD}/payload/MoviePilot/app/runtime/config.py"; then
+        (cd "${BUILD}/payload/MoviePilot/app/modules" && "${PY}" - <<'PYEOF' || die "bangumi 域名补丁失败"
+import io
+
+def apply(path, replacements, marker="fn-native-moviepilot 补丁"):
+    src = io.open(path, encoding="utf-8").read()
+    if marker in src:
+        print(f"{path}: 已有补丁标记，跳过")
+        return
+    for anchor, patch in replacements:
+        if anchor not in src:
+            raise SystemExit(f"{path}: 锚点未找到，上游结构已变化，需人工复核")
+        src = src.replace(anchor, patch, 1)
+    io.open(path, "w", encoding="utf-8", newline="").write(src)
+    print(f"{path}: 补丁已应用")
+
+# 1) config.py 新增配置字段（默认仍官方域名，不改变上游行为）
+apply(
+    "../runtime/config.py",
+    [(
+        '    TMDB_API_KEY: str = "db55323b8d3e4154498498a75642b381"\n',
+        '    TMDB_API_KEY: str = "db55323b8d3e4154498498a75642b381"\n'
+        '    # fn-native-moviepilot 补丁：Bangumi API地址（api.bgm.tv 在部分地区被\n'
+        '    # SNI 层封锁，可配置镜像域名如 api.bangumi.lol）\n'
+        '    BANGUMI_API_DOMAIN: str = "api.bgm.tv"\n',
+    )],
+)
+
+# 2) bangumi.py 实例化时读取配置（CONFIG_WATCH 触发模块重建后即时生效；
+#    类属性保留官方域名作参照，self._base_url 在 __invoke 中优先命中）
+apply(
+    "bangumi/bangumi.py",
+    [(
+        "    def __init__(self):\n        self._session = requests.Session()\n",
+        "    def __init__(self):\n"
+        "        # fn-native-moviepilot 补丁：API 域名可配置\n"
+        "        self._base_url = f\"https://{settings.BANGUMI_API_DOMAIN}/\"\n"
+        "        self._session = requests.Session()\n",
+    )],
+)
+
+# 3) 模块 CONFIG_WATCH + 连通性测试同步使用配置域名
+apply(
+    "bangumi/__init__.py",
+    [
+        (
+            '    CONFIG_WATCH = {"PROXY_HOST"}\n',
+            '    # fn-native-moviepilot 补丁：域名变更加入热重建监听\n'
+            '    CONFIG_WATCH = {"PROXY_HOST", "BANGUMI_API_DOMAIN"}\n',
+        ),
+        (
+            'get_res("https://api.bgm.tv/")',
+            'get_res(f"https://{settings.BANGUMI_API_DOMAIN}/")',
+        ),
+    ],
+)
+PYEOF
+)
+        log "已应用 Bangumi API 域名可配置补丁（默认官方，可切镜像）"
+    else
+        log "上游已支持 BANGUMI_API_DOMAIN（或结构变化），跳过补丁"
+    fi
+
     FRONTEND_VERSION="$("${PY}" -c '
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
