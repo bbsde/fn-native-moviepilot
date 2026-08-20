@@ -190,6 +190,14 @@ EOF
                 && log "${_key} 已生成并写入 app.env"
         fi
     done
+    # 无梯子直连默认值（仅缺失时写入；依据见 install_callback 同名说明）
+    for _kv in "TMDB_API_DOMAIN=api.tmdb.org" "GITHUB_PROXY=https://ghproxy.net/"; do
+        _key="${_kv%%=*}" _val="${_kv#*=}"
+        if ! grep -qE "^[[:space:]]*${_key}=" "${local_keys_env}"; then
+            printf "%s='%s'\n" "${_key}" "${_val}" >> "${local_keys_env}" \
+                && log "${_key} 默认值已写入 app.env（无梯子直连优化）"
+        fi
+    done
 else
     log "[WARN] 无法定位共享区 config 目录，保留 .moviepilot.env 现状"
 fi

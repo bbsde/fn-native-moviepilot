@@ -289,6 +289,32 @@ EOF
     log "MOVIEPILOT_AUTO_UPDATE=false 已写入 app.env"
 
     ensure_secret_keys
+    ensure_direct_env_defaults
+}
+
+# --------------------------------------------------------------------------
+# 无梯子直连默认值（仅缺失时写入，用户已改过的值绝不覆盖）
+# 真机实测（2026-08，详见 docs/v3-build-plan.md §13）：
+# - api.themoviedb.org 的 DNS 被污染（解析到无关网段，TCP 不通）→ 探索/识别全断；
+#   官方别名 api.tmdb.org 未被污染、同源服务，直连 0.7s 可用。
+# - raw.githubusercontent.com 直连间歇性重置（4 测 2 断）→ 插件市场时好时坏；
+#   ghproxy.net 为实测最快的可用加速镜像（镜像有生命周期，失效后可在
+#   设定→高级设置→网络 中清除或更换，MP 会自动回退直连策略）。
+# --------------------------------------------------------------------------
+ensure_direct_env_defaults() {
+    local env_file="${CONFIG_DIR}/app.env"
+    touch "${env_file}"
+    local kv key val
+    for kv in "TMDB_API_DOMAIN=api.tmdb.org" "GITHUB_PROXY=https://ghproxy.net/"; do
+        key="${kv%%=*}" val="${kv#*=}"
+        if grep -qE "^[[:space:]]*${key}=" "${env_file}"; then
+            log "${key} 已有配置，保持不变"
+            continue
+        fi
+        [ -s "${env_file}" ] && [ "$(tail -c1 "${env_file}" 2>/dev/null)" != $'\n' ] && printf '\n' >> "${env_file}"
+        printf "%s='%s'\n" "${key}" "${val}" >> "${env_file}"
+        log "${key} 默认值已写入 app.env（无梯子直连优化）"
+    done
 }
 
 # --------------------------------------------------------------------------
