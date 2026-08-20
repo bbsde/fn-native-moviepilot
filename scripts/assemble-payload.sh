@@ -113,7 +113,12 @@ stage_source() {
     # 不认 ModuleManager 本身 → 处理器被事件系统永久跳过 → 配置变更从不触发模块
     # 重建（媒体服务器/下载器改配置后坏实例滞留、必须重启才生效的根因）。
     # 补丁：resolver 先识别自身类。上游修复后锚点消失，补丁自动停用。
-    if grep -q '按 canonical class identity 绑定当前 generation' \
+    # 锚点分级（auto-follow 友好）：上游已用等价写法自修 → 干净跳过；
+    # 锚点在但结构性重构 → 构建 die（fail-closed，宁停摆不无补丁发布）。
+    if grep -q 'owner_class is type(self)' \
+        "${BUILD}/payload/MoviePilot/app/runtime/extensions/module_manager.py"; then
+        log "上游已自带等价修复（owner_class is type(self)），跳过补丁"
+    elif grep -q '按 canonical class identity 绑定当前 generation' \
         "${BUILD}/payload/MoviePilot/app/runtime/extensions/module_manager.py"; then
         (cd "${BUILD}/payload/MoviePilot/app/runtime/extensions" && "${PY}" - <<'PYEOF' || die "module_manager 补丁失败"
 import io
@@ -178,26 +183,28 @@ apply(
 )
 
 # 2) bangumi.py 实例化时读取配置（CONFIG_WATCH 触发模块重建后即时生效；
-#    类属性保留官方域名作参照，self._base_url 在 __invoke 中优先命中）
+#    类属性保留官方域名作参照，self._base_url 在 __invoke 中优先命中）。
+#    锚点只锚 def 行——方法体变动不断锚
 apply(
     "bangumi/bangumi.py",
     [(
-        "    def __init__(self):\n        self._session = requests.Session()\n",
+        "    def __init__(self):\n",
         "    def __init__(self):\n"
         "        # fn-native-moviepilot 补丁：API 域名可配置\n"
-        "        self._base_url = f\"https://{settings.BANGUMI_API_DOMAIN}/\"\n"
-        "        self._session = requests.Session()\n",
+        "        self._base_url = f\"https://{settings.BANGUMI_API_DOMAIN}/\"\n",
     )],
 )
 
-# 3) 模块 CONFIG_WATCH + 连通性测试同步使用配置域名
+# 3) 模块 CONFIG_WATCH + 连通性测试同步使用配置域名。
+#    CONFIG_WATCH 锚「开括号」子串——上游往集合加键不断锚
+#    （替换产生的重复元素在 set 字面量中无害）
 apply(
     "bangumi/__init__.py",
     [
         (
-            '    CONFIG_WATCH = {"PROXY_HOST"}\n',
-            '    # fn-native-moviepilot 补丁：域名变更加入热重建监听\n'
-            '    CONFIG_WATCH = {"PROXY_HOST", "BANGUMI_API_DOMAIN"}\n',
+            "    CONFIG_WATCH = {",
+            "    # fn-native-moviepilot 补丁：域名变更加入热重建监听\n"
+            '    CONFIG_WATCH = {"PROXY_HOST", "BANGUMI_API_DOMAIN", ',
         ),
         (
             'get_res("https://api.bgm.tv/")',
@@ -234,24 +241,24 @@ def apply(path, replacements, marker="fn-native-moviepilot 补丁"):
     io.open(path, "w", encoding="utf-8", newline="").write(src)
     print(f"{path}: 补丁已应用")
 
-# 1) 数据集 URL 改为实例属性：设置 GITHUB_PROXY 时前缀拼接（空值保持直连）
+# 1) 数据集 URL 改为实例属性：设置 GITHUB_PROXY 时前缀拼接（空值保持直连）。
+#    RHS 读的是类属性——上游换数据集地址自动跟随，不复制 URL（防静默漂移 404）
 apply(
     "anilist.py",
     [(
-        "        self._proxy_available = True\n",
+        "    def __init__(self) -> None:\n",
+        "    def __init__(self) -> None:\n"
         "        # fn-native-moviepilot 补丁：中文数据集经 GITHUB_PROXY 加速（raw 直连间歇重置）\n"
-        "        _ds = \"https://raw.githubusercontent.com/soruly/anilist-chinese/master/anilist-chinese.json\"\n"
-        "        self._translations_url = f\"{settings.GITHUB_PROXY or ''}{_ds}\"\n"
-        "        self._proxy_available = True\n",
+        "        self._translations_url = f\"{settings.GITHUB_PROXY or ''}{self._translations_url}\"\n",
     )],
 )
-# 2) GITHUB_PROXY 变更加入热重建监听（重建后按新代理地址取数据集）
+# 2) GITHUB_PROXY 变更加入热重建监听（锚「开括号」子串，上游加键不断锚）
 apply(
     "__init__.py",
     [(
-        '    CONFIG_WATCH = {"PROXY_HOST"}\n',
-        '    # fn-native-moviepilot 补丁：GITHUB_PROXY 变更后重建以更新数据集地址\n'
-        '    CONFIG_WATCH = {"PROXY_HOST", "GITHUB_PROXY"}\n',
+        "    CONFIG_WATCH = {",
+        "    # fn-native-moviepilot 补丁：GITHUB_PROXY 变更后重建以更新数据集地址\n"
+        '    CONFIG_WATCH = {"PROXY_HOST", "GITHUB_PROXY", ',
     )],
 )
 PYEOF

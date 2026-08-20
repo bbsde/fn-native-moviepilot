@@ -1,5 +1,5 @@
 appname=moviepilot
-version=3.0.0.7
+version=3.0.0.8
 display_name=MoviePilot
 desc=自动化媒体管理工具，支持资源搜索、订阅、整理、刮削，集成转移、通知与文件管理。安装时请设置管理员账号密码。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=moviepilot.Application
 install_dep_apps=nodejs_v24
 ctl_stop=true
-changelog="MoviePilot v3.0.0<br>【v3 线】线上全量构建、fpk 自包含离线安装<br>3.0.0.2：init 缺陷修复；venv 三级兜底；3.0.0.3：密钥持久化；3.0.0.4：配置变更热重建模块；3.0.0.5：无梯子直连默认值（api.tmdb.org + ghproxy.net）；3.0.0.6：Bangumi API 域名可配置（默认镜像 api.bangumi.lol）；3.0.0.7：AniList 中文数据集经 GITHUB_PROXY 加速"
+changelog="MoviePilot v3.0.0<br>【v3 线】线上全量构建、fpk 自包含离线安装<br>3.0.0.2：init 缺陷修复；venv 三级兜底；3.0.0.3：密钥持久化；3.0.0.4：配置变更热重建模块；3.0.0.5：无梯子直连默认值（api.tmdb.org + ghproxy.net）；3.0.0.6：Bangumi API 域名可配置（默认镜像 api.bangumi.lol）；3.0.0.7：AniList 中文数据集经 GITHUB_PROXY 加速；3.0.0.8：构建补丁锚点加固（无行为变化）"
