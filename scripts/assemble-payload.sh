@@ -212,6 +212,55 @@ PYEOF
         log "上游已支持 BANGUMI_API_DOMAIN（或结构变化），跳过补丁"
     fi
 
+    # 补丁 4：AniList 中文数据集经 GITHUB_PROXY 加速。上游硬编码
+    # raw.githubusercontent.com 直连拉取 854KB 的 anilist-chinese.json（中文
+    # 标题数据），该域名国内间歇性重置（实测 3.6~14.8s，运气差卡满读超时），
+    # 拖慢探索页 AniList 源首次加载。补丁：设置 GITHUB_PROXY 时前缀拼接
+    # （与上游 resource.py 对 raw 域的用法一致），留空则保持直连。
+    if ! grep -q 'GITHUB_PROXY' \
+        "${BUILD}/payload/MoviePilot/app/modules/anilist/anilist.py"; then
+        (cd "${BUILD}/payload/MoviePilot/app/modules/anilist" && "${PY}" - <<'PYEOF' || die "anilist 数据集补丁失败"
+import io
+
+def apply(path, replacements, marker="fn-native-moviepilot 补丁"):
+    src = io.open(path, encoding="utf-8").read()
+    if marker in src:
+        print(f"{path}: 已有补丁标记，跳过")
+        return
+    for anchor, patch in replacements:
+        if anchor not in src:
+            raise SystemExit(f"{path}: 锚点未找到，上游结构已变化，需人工复核")
+        src = src.replace(anchor, patch, 1)
+    io.open(path, "w", encoding="utf-8", newline="").write(src)
+    print(f"{path}: 补丁已应用")
+
+# 1) 数据集 URL 改为实例属性：设置 GITHUB_PROXY 时前缀拼接（空值保持直连）
+apply(
+    "anilist.py",
+    [(
+        "        self._proxy_available = True\n",
+        "        # fn-native-moviepilot 补丁：中文数据集经 GITHUB_PROXY 加速（raw 直连间歇重置）\n"
+        "        _ds = \"https://raw.githubusercontent.com/soruly/anilist-chinese/master/anilist-chinese.json\"\n"
+        "        self._translations_url = f\"{settings.GITHUB_PROXY or ''}{_ds}\"\n"
+        "        self._proxy_available = True\n",
+    )],
+)
+# 2) GITHUB_PROXY 变更加入热重建监听（重建后按新代理地址取数据集）
+apply(
+    "__init__.py",
+    [(
+        '    CONFIG_WATCH = {"PROXY_HOST"}\n',
+        '    # fn-native-moviepilot 补丁：GITHUB_PROXY 变更后重建以更新数据集地址\n'
+        '    CONFIG_WATCH = {"PROXY_HOST", "GITHUB_PROXY"}\n',
+    )],
+)
+PYEOF
+)
+        log "已应用 AniList 数据集 GITHUB_PROXY 加速补丁"
+    else
+        log "上游 anilist 已引用 GITHUB_PROXY（或结构变化），跳过补丁"
+    fi
+
     FRONTEND_VERSION="$("${PY}" -c '
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
