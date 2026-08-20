@@ -95,10 +95,10 @@ stage_source() {
     [ -f "${BUILD}/payload/MoviePilot/requirements.in" ] || die "源码包缺少 requirements.in（tag 异常？）"
     [ -f "${BUILD}/payload/MoviePilot/scripts/local_setup.py" ] || die "源码包缺少 scripts/local_setup.py"
 
-    # 上游 v3.0.0 首日 bug：local_setup.py 的 _ensure_superuser_account_inner
+    # 补丁 1：上游 v3.0.0 首日 bug——local_setup.py 的 _ensure_superuser_account_inner
     # 引用不存在的 app.application.security.access（get_password_hash 实际在
-    # app.application.security.token），init --superuser 必炸。构建期修正；
-    # 上游修复/改动此行后 sed 自然失效（仅记录，不阻断）。
+    # app.application.security.token），init --superuser 必炸。上游修复/改动此行后
+    # sed 自然失效（仅记录，不阻断）。
     if grep -q 'from app.application.security.access import get_password_hash' \
         "${BUILD}/payload/MoviePilot/scripts/local_setup.py"; then
         sed -i 's|from app.application.security.access import get_password_hash|from app.application.security.token import get_password_hash|' \
@@ -106,6 +106,41 @@ stage_source() {
         log "已修正上游 v3.0.0 security.access 错误导入（→ security.token）"
     else
         log "上游 security.access 导入已不存在（上游已修复或结构变化），跳过补丁"
+    fi
+
+    # 补丁 2：上游 v3.0.0 事件绑定缺陷——ModuleManager 订阅了自己的
+    # handle_config_changed，但其注册的 resolver 只匹配受管模块类（app/modules/*），
+    # 不认 ModuleManager 本身 → 处理器被事件系统永久跳过 → 配置变更从不触发模块
+    # 重建（媒体服务器/下载器改配置后坏实例滞留、必须重启才生效的根因）。
+    # 补丁：resolver 先识别自身类。上游修复后锚点消失，补丁自动停用。
+    if grep -q '按 canonical class identity 绑定当前 generation' \
+        "${BUILD}/payload/MoviePilot/app/runtime/extensions/module_manager.py"; then
+        (cd "${BUILD}/payload/MoviePilot/app/runtime/extensions" && "${PY}" - <<'PYEOF' || die "module_manager 补丁失败"
+import io
+path = "module_manager.py"
+src = io.open(path, encoding="utf-8").read()
+anchor = '        """按 canonical class identity 绑定当前 generation，停止态阻断 fallback 构造。"""\n'
+patch = anchor + (
+    "        # fn-native-moviepilot 补丁：本类自身订阅的 handle_config_changed 也由\n"
+    "        # 本 resolver 绑定（上游实现只匹配受管模块类，本类处理器被事件系统\n"
+    "        # 跳过，配置变更因此从不触发模块重建）\n"
+    "        if owner_class is type(self):\n"
+    "            return EventHandlerBinding(\n"
+    "                instance=self,\n"
+    "                owner_name=\"ModuleManager\",\n"
+    "                run_sync_in_threadpool=True,\n"
+    "            )\n"
+)
+if "fn-native-moviepilot 补丁" not in src:
+    if anchor not in src:
+        raise SystemExit("锚点未找到，上游结构已变化，需人工复核")
+    io.open(path, "w", encoding="utf-8", newline="").write(src.replace(anchor, patch, 1))
+print("module_manager resolver 补丁已应用")
+PYEOF
+)
+        log "已修补 ModuleManager resolver 自身识别（配置变更可触发模块重建）"
+    else
+        log "module_manager 锚点不存在（上游已修复或重构），跳过补丁"
     fi
 
     FRONTEND_VERSION="$("${PY}" -c '
