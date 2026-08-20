@@ -2,20 +2,18 @@
 #
 # config_callback — 用户在应用设置页提交配置后调用（root 身份）
 #
-# 处理：
-#   1) 网桥免登录账号绑定（wizard_superuser / wizard_password）
-#      用户在应用设置页（wizard/config 向导）填入的账号密码，写入 app.env 的
-#      SUPERUSER / SUPERUSER_PASSWORD。网关桥（gateway-bridge.js）启动时读这两个
-#      字段，用它走 /api/v1/login/access-token 换 JWT，注入前端 SPA 实现免登录。
+# 处理：网桥免登录账号绑定（wizard_superuser / wizard_password）
+#   用户在应用设置页（wizard/config 向导）填入的账号密码，写入 app.env 的
+#   SUPERUSER / SUPERUSER_PASSWORD。网关桥（gateway-bridge.js）启动时读这两个
+#   字段，用它走 /api/v1/login/access-token 换 JWT，注入前端 SPA 实现免登录。
 #
-#      场景：用户在 MoviePilot 网页改了密码后，需在此同步更新免登录密码，否则
-#      桥用旧密码登录失败，免登录降级为手动登录。
+#   场景：用户在 MoviePilot 网页改了密码后，需在此同步更新免登录密码，否则
+#   桥用旧密码登录失败，免登录降级为手动登录。
 #
-#   2) 目录授权（wizard_grant_dirs）
-#      fnOS 权限模型下应用用户默认只能访问自有 data-share；媒体库/下载目录等
-#      用户共享目录需逐目录授 ACL。见 setup_grant_dirs 注释。
+#   目录访问授权不在此处理：使用 fnOS 应用设置自带的「配置访问权限」
+#   （原生入口，按目录为应用用户授 ACL）。
 #
-#   留空语义：wizard 字段留空 = 不修改当前值（保留现有配置/授权）。
+#   留空语义：wizard 字段留空 = 不修改当前值（保留 app.env 现有内容）。
 #
 # 幂等：重复执行不破坏数据。仅在字段非空时才写 app.env。
 # 改完后重启应用：让桥重新读凭据 + 用新密码登录。
@@ -120,11 +118,22 @@ setup_bridge_autologin() {
 # 重启应用（让 cmd/main 重新拉起，桥重新读 app.env 凭据）
 # config_callback 以 root 跑，cmd/main 需以应用用户身份执行（main 内部 prepare_env
 # 会切到正确的 PATH/HOME）。用 runuser 切换到 APP_USER 调 main stop/start。
+# 注意：cmd/ 位于应用根目录（/var/apps/<appname>/cmd），不在 target 下
+# （TRIM_APPDEST 指向 target），此处逐候选解析。
 # --------------------------------------------------------------------------
 restart_app() {
-    local main_script="${APP_DEST}/cmd/main"
-    [ -x "${main_script}" ] || {
-        log "[WARN] cmd/main 不可执行（${main_script}），请手动重启应用"
+    local main_script=""
+    local cand
+    for cand in "/var/apps/moviepilot/cmd/main" \
+                "${TRIM_APPDEST%/target}/cmd/main" \
+                "${APP_DEST}/cmd/main"; do
+        if [ -x "${cand}" ]; then
+            main_script="${cand}"
+            break
+        fi
+    done
+    [ -n "${main_script}" ] || {
+        log "[WARN] 未找到可执行的 cmd/main，请手动重启应用"
         return 0
     }
 
@@ -165,76 +174,9 @@ restart_app() {
 # 且 venv 依赖按 payload.lock 装配、与新版源码脱钩。唯一更新通道 = 安装新 fpk；
 # cmd/main 启动时无条件强制 MOVIEPILOT_AUTO_UPDATE=false（含网页内勾选）。
 
-# --------------------------------------------------------------------------
-# 目录授权（wizard_grant_dirs：逗号分隔的目录绝对路径）
-#   fnOS 权限模型：应用默认只能访问自有 data-share；媒体库/下载目录等用户
-#   共享目录（/volN/...）需逐目录为应用用户授 ACL（平台惯例，与系统内其他
-#   应用的授权形态一致）。本回调以 root 运行，直接 setfacl：
-#   - 目标目录：递归 rwx + 默认 ACL（新建子目录自动继承）→ 整理/转移/刮削可写
-#   - 各级祖先目录：仅 r-x → 网页目录浏览器可逐级浏览到目标，但授权范围
-#     之外的内容不可访问
-#   授权记录写入 granted_dirs.txt，卸载时统一回收。留空 = 不修改，幂等。
-# --------------------------------------------------------------------------
-setup_grant_dirs() {
-    local raw="${wizard_grant_dirs:-}"
-    [ -z "${raw}" ] && { log "目录授权未修改（留空），跳过"; return 0; }
-
-    local config_dir
-    config_dir="$(resolve_config_dir 2>/dev/null)" || {
-        log "[WARN] 无法定位 config 目录，目录授权未执行"
-        return 0
-    }
-    local granted_list="${config_dir}/granted_dirs.txt"
-
-    raw="${raw//，/,}"   # 中文逗号兼容
-    local dir IFS=','
-    for dir in ${raw}; do
-        dir="${dir#"${dir%%[![:space:]]*}"}"   # 去首空白
-        dir="${dir%"${dir##*[![:space:]]}"}"   # 去尾空白
-        [ -n "${dir}" ] || continue
-        if [ ! -d "${dir}" ]; then
-            log "[WARN] 目录不存在，跳过：${dir}"
-            continue
-        fi
-        if [ "${dir}" = "/" ] || printf '%s' "${dir}" | grep -qE '^/vol[0-9]+/?$'; then
-            log "[WARN] 不允许授权根/卷根目录：${dir}"
-            continue
-        fi
-
-        # 祖先链（卷根→目标上级）仅授 r-x，逐级浏览可达
-        local anc_list="" p="${dir%/}"
-        while [ "${p}" != "/" ] && [ -n "${p}" ]; do
-            p="${p%/*}"
-            [ -z "${p}" ] && p="/"
-            anc_list="${p}
-${anc_list}"
-        done
-        local anc
-        while IFS= read -r anc; do
-            case "${anc}" in ""|/) continue ;; esac
-            setfacl -m "u:${APP_USER}:r-x" "${anc}" 2>/dev/null \
-                || log "[WARN] 祖先目录授权失败：${anc}"
-        done <<EOF
-${anc_list}
-EOF
-
-        # 目标递归 rwx + 默认继承（幂等；大目录树可能耗时数分钟）
-        if setfacl -R -m "u:${APP_USER}:rwx" "${dir}" 2>/dev/null \
-            && setfacl -R -d -m "u:${APP_USER}:rwx" "${dir}" 2>/dev/null; then
-            log "目录已授权读写（子目录自动继承）：${dir}"
-            touch "${granted_list}"
-            grep -qxF "${dir}" "${granted_list}" 2>/dev/null || echo "${dir}" >> "${granted_list}"
-            chown "${APP_USER}:${APP_GROUP}" "${granted_list}" 2>/dev/null || true
-        else
-            log "[WARN] 目录授权失败：${dir}（setfacl 不可用或路径异常）"
-        fi
-    done
-    return 0
-}
 
 log "=== 应用配置变更 ==="
 setup_bridge_autologin
-setup_grant_dirs
 # 配置改了 app.env → 重启让后端/桥重读
 if [ -n "${wizard_superuser:-}${wizard_password:-}" ]; then
     restart_app
