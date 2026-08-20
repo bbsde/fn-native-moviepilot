@@ -180,6 +180,16 @@ if [ -n "${CONFIG_DIR}" ]; then
 CONFIG_DIR=${CONFIG_DIR}
 EOF
     log "CONFIG_DIR=${CONFIG_DIR}"
+    # 持久化 JWT/资源签名密钥（缺失才生成；上游默认每次启动随机 → 重启掉登录态）
+    local_keys_env="${CONFIG_DIR}/app.env"
+    touch "${local_keys_env}"
+    for _key in SECRET_KEY RESOURCE_SECRET_KEY; do
+        if ! grep -qE "^[[:space:]]*${_key}=" "${local_keys_env}"; then
+            _val="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+            [ -n "${_val}" ] && printf '%s=%s\n' "${_key}" "${_val}" >> "${local_keys_env}" \
+                && log "${_key} 已生成并写入 app.env"
+        fi
+    done
 else
     log "[WARN] 无法定位共享区 config 目录，保留 .moviepilot.env 现状"
 fi

@@ -287,6 +287,31 @@ EOF
         printf 'MOVIEPILOT_AUTO_UPDATE=false\n' >> "${env_file}"
     fi
     log "MOVIEPILOT_AUTO_UPDATE=false 已写入 app.env"
+
+    ensure_secret_keys
+}
+
+# --------------------------------------------------------------------------
+# 持久化 JWT/资源签名密钥（缺失才生成，绝不覆盖已有值）
+# 上游默认每次进程启动随机生成 SECRET_KEY / RESOURCE_SECRET_KEY → 重启后
+# 所有登录态与图片 URL 签名全部失效，用户被迫重新登录。写入 app.env 固定后，
+# 重启/升级均保持登录态（Docker 用户同理通过环境变量固定）。
+# --------------------------------------------------------------------------
+ensure_secret_keys() {
+    local env_file="${CONFIG_DIR}/app.env"
+    touch "${env_file}"
+    local key val
+    for key in SECRET_KEY RESOURCE_SECRET_KEY; do
+        if grep -qE "^[[:space:]]*${key}=" "${env_file}"; then
+            log "${key} 已存在，保持不变"
+            continue
+        fi
+        val="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+        [ -n "${val}" ] || fail "生成 ${key} 失败"
+        [ -s "${env_file}" ] && [ "$(tail -c1 "${env_file}" 2>/dev/null)" != $'\n' ] && printf '\n' >> "${env_file}"
+        printf '%s=%s\n' "${key}" "${val}" >> "${env_file}"
+        log "${key} 已生成并写入 app.env"
+    done
 }
 
 # --------------------------------------------------------------------------

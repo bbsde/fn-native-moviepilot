@@ -1,5 +1,5 @@
 appname=moviepilot
-version=3.0.0.2
+version=3.0.0.3
 display_name=MoviePilot
 desc=自动化媒体管理工具，支持资源搜索、订阅、整理、刮削，集成转移、通知与文件管理。安装时请设置管理员账号密码。
 source=thirdparty
