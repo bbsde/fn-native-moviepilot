@@ -1,0 +1,105 @@
+#!/bin/bash
+#
+# upgrade_callback — fnOS 应用包（fpk）升级后执行
+#
+# 职责边界（重要）：
+#   本脚本只管「fnOS 应用包」自己的升级收尾，不管 MoviePilot 本体的更新。
+#   MoviePilot 的在线更新（后端/前端/内核）一律走上游自己的 `moviepilot update`
+#   （网页内触发或 SSH 执行），上游会自行 git pull / 重建前端 / 下载内核，
+#   本应用不接管、不重复、不干预。
+#
+# fpk 升级时发生了什么：
+#   1. fnOS 用新 fpk 覆盖 target（脚本/ICON/网关桥等），保留 var（TRIM_PKGVAR）。
+#      → MoviePilot 源码、venv、前端、cloakbrowser 内核都在 var 下，原样保留，
+#        不需要 git pull、不需要 setup 重建、不需要重下内核。
+#   2. fnOS 升级前后会自动 stop/start 应用（cmd/main）。
+#   3. 本脚本以 root 身份运行，新解压的 target 文件属主是 root；
+#      而 cmd/main 以 moviepilot 用户运行，需修正属主保证可读写。
+#
+# 因此本脚本只做一件事：修正属主。
+
+set -uo pipefail
+
+APP_USER="${TRIM_USERNAME:-moviepilot}"
+APP_GROUP="${TRIM_GROUPNAME:-moviepilot}"
+ERR_FILE="${TRIM_TEMP_LOGFILE}"
+DATA_DIR="${TRIM_PKGVAR:-}"
+INSTALL_LOG="${DATA_DIR}/install.log"
+HOME_DIR="${TRIM_PKGHOME:-}"
+LOCAL_BIN_DIR="${HOME_DIR}/.local/bin"
+GH_PROXY="${TRIM_APPDEST:-}/bin/gh-proxy"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | [UPGRADE] $*" | tee -a "${INSTALL_LOG}" 2>/dev/null || \
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | [UPGRADE] $*"
+}
+
+[ -n "${DATA_DIR}" ] || { echo "TRIM_PKGVAR 未设置" > "${ERR_FILE:-/dev/null}"; exit 1; }
+
+# fpk 升级只覆盖 target（root 属主），var（程序本体/数据）原样保留。
+# 修正 target 属主，使 moviepilot 用户运行时可读写（尤其网关桥、bin 等）。
+log "=== fpk 升级：修正属主 ==="
+if chown -R "${APP_USER}:${APP_GROUP}" "${TRIM_APPDEST}" 2>/dev/null; then
+    log "target 属主已修正：${APP_USER}:${APP_GROUP}"
+else
+    log "[WARN] chown ${TRIM_APPDEST} 失败（可能权限受限）"
+fi
+
+# 兜底：确保 bin/ 下脚本/二进制可执行（fpk 解压偶发丢执行位）
+if [ -d "${TRIM_APPDEST}/bin" ]; then
+    chmod +x "${TRIM_APPDEST}/bin/gateway-bridge.js" "${TRIM_APPDEST}/bin/gh-proxy" 2>/dev/null || true
+fi
+
+# 补装持久化 curl shim（老版本 fpk 没有此 shim，升级后补上让 moviepilot update 走 gh-proxy）。
+# 幂等：shim 已存在则跳过（避免覆盖用户可能的定制；重装走 install_callback 会重生成）。
+if [ -n "${HOME_DIR}" ] && [ -x "${GH_PROXY}" ] && [ ! -x "${LOCAL_BIN_DIR}/curl" ]; then
+    mkdir -p "${LOCAL_BIN_DIR}"
+    real_curl="/usr/bin/curl"
+    [ -x "${real_curl}" ] || real_curl="$(command -v curl 2>/dev/null)" || real_curl="/usr/bin/curl"
+    cat > "${LOCAL_BIN_DIR}/curl" <<'SHIMEOF'
+#!/bin/bash
+# 由 fn-native-moviepilot 生成的 curl shim：GitHub 请求 → gh-proxy 加速
+GH_PROXY="__GH_PROXY__"
+REAL_CURL="__REAL_CURL__"
+orig=("$@")
+url=""; out=""; prev=""
+for a in "$@"; do
+    case "$prev" in -o|--output) out="$a"; prev=""; continue;; esac
+    case "$a" in
+        -o|--output) prev="$a";; -o*) out="${a#-o}";; --output=*) out="${a#*=}";;
+        -*) ;; *) url="$a";;
+    esac
+done
+if printf '%s' "$url" | grep -q 'api\.github\.com/repos/'; then
+    repo="$(printf '%s' "$url" | sed -nE 's|.*/repos/([^/]+/[^/]+).*|\1|p')"
+    tag="$(printf '%s' "$url" | sed -nE 's|.*/releases/tags/(.+)|\1|p')"
+    [ -z "$tag" ] && tag="$(printf '%s' "$url" | sed -nE 's|.*/releases/latest|latest|p')"
+    if [ -n "$repo" ] && [ -n "$tag" ]; then
+        if [ "$tag" = "latest" ] && [ -x "$GH_PROXY" ]; then
+            real_tag="$("$GH_PROXY" latest-tag "$repo" 2>/dev/null)" || real_tag=""
+            [ -n "$real_tag" ] && tag="$real_tag"
+        fi
+        printf '{"tag_name":"%s","assets":[{"name":"dist.zip","browser_download_url":"%s"}]}\n' \
+            "$tag" "https://github.com/${repo}/releases/download/${tag}/dist.zip"
+        exit 0
+    fi
+fi
+if [ -n "$url" ] && printf '%s' "$url" | grep -qE 'github\.com|githubusercontent\.com'; then
+    [ -z "$out" ] && out="$(basename "$url")"
+    path="${url#*://}"; path="${path#*/}"
+    if "$GH_PROXY" download "$path" -o "$out" 2>/dev/null; then exit 0; fi
+fi
+exec "$REAL_CURL" "${orig[@]}"
+SHIMEOF
+    sed -i "s|__GH_PROXY__|${GH_PROXY}|g; s|__REAL_CURL__|${real_curl}|g" "${LOCAL_BIN_DIR}/curl"
+    chmod +x "${LOCAL_BIN_DIR}/curl"
+    chown -R "${APP_USER}:${APP_GROUP}" "${LOCAL_BIN_DIR}" 2>/dev/null || true
+    log "补装 curl shim：${LOCAL_BIN_DIR}/curl"
+fi
+
+# 兜底：清理升级前可能残留的网关 socket（旧桥未被正确 stop 时，新桥 bind 会失败）
+rm -f "${TRIM_APPDEST}/app.sock" 2>/dev/null || true
+
+log "=== fpk 升级完成 ==="
+log "（MoviePilot 本体更新请通过上游 moviepilot update 进行，本脚本不介入）"
+exit 0

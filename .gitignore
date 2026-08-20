@@ -1,1 +1,21 @@
-develop
+# ===== 构建产物 / 二进制（不入库）=====
+
+# fpk 打包产物
+*.fpk
+
+# cron 会话快照（Hermes 运行时生成，日期时间戳格式无扩展名）
+[0-9]*_[0-9]*_[0-9a-f]*
+
+# ===== develop/ 构建环境（NAS 构建时使用）=====
+develop/build.log
+develop/auto-update.log
+
+# develop/ 下的上游源码（探索/参考用，不入库）
+develop/MoviePilot/
+develop/MoviePilot-Frontend/
+
+# ===== 编辑器 / 工具 =====
+.zcode/
+
+# 日志
+*.log

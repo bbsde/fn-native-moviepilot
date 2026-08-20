@@ -1,0 +1,28 @@
+{
+    "data-share":
+    {
+        "shares":
+        [
+            {
+                "name": "moviepilot/config",
+                "permission":
+                {
+                    "rw":
+                    [
+                        "moviepilot"
+                    ]
+                }
+            },
+            {
+                "name": "moviepilot/data",
+                "permission":
+                {
+                    "rw":
+                    [
+                        "moviepilot"
+                    ]
+                }
+            }
+        ]
+    }
+}

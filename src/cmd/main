@@ -1,0 +1,342 @@
+#!/bin/bash
+#
+# main — MoviePilot 应用生命周期：start / stop / status
+#
+# 架构（fnOS 统一网关模式）：
+#   浏览器 → fnOS 网关 /app/moviepilot/ → Unix Socket ${TRIM_APPDEST}/app.sock
+#           → gateway-bridge.js（剥前缀）→ 前端 :3000（上游 service.js）
+#           → 后端 :3001（FastAPI）
+#
+# start 流程：moviepilot CLI spawn 后端(3001)+前端(3000) → 前端就绪后
+#             拉起 gateway-bridge 监听 socket，网关入口才可用。
+# stop  流程：先停 gateway-bridge，再 moviepilot stop。
+# status：前端 :3000 与 gateway socket 双就绪才算运行中。
+#
+# 运行身份：moviepilot 用户（run-as: package）
+
+set -uo pipefail
+
+MP_ROOT="${TRIM_PKGVAR}/MoviePilot"
+NODE_RUNTIME_BIN="${TRIM_PKGHOME}/nodejs/bin"
+LOCAL_BIN_DIR="${TRIM_PKGHOME}/.local/bin"
+INSTALL_LOG="${TRIM_PKGVAR}/info.log"
+
+# fnOS 统一网关：网关把 /app/moviepilot/** 转发到 ${TRIM_APPDEST}/app.sock。
+# gateway-bridge 监听该 socket，剥掉前缀后转发到前端 :3000（上游不感知前缀，
+# 也不改一行上游代码）。桥脚本随包分发，路径见 ${GATEWAY_BRIDGE}。
+GATEWAY_PREFIX="/app/moviepilot"
+GATEWAY_BRIDGE="${TRIM_APPDEST}/bin/gateway-bridge.js"
+GATEWAY_SOCK="${TRIM_APPDEST}/app.sock"
+GATEWAY_PID="${TRIM_PKGVAR}/gateway-bridge.pid"
+GATEWAY_LOG="${TRIM_PKGVAR}/gateway-bridge.log"
+
+# MoviePilot 后端/前端端口（与上游 config.py 默认值一致）
+# 后端 FastAPI/uvicorn :3001，前端 service.js :3000
+BACKEND_PORT=3001
+FRONTEND_PORT=3000
+
+# 从共享区定位 config 目录（与 install_callback 保持一致）
+resolve_config_dir() {
+    local paths="${TRIM_DATA_SHARE_PATHS:-}"
+    local p
+    if [ -n "${paths}" ]; then
+        local IFS=':'
+        for p in ${paths}; do
+            if [ -n "${p}" ] && echo "${p}" | grep -Eq '/config/?$'; then
+                echo "${p}"
+                return 0
+            fi
+        done
+    fi
+    [ -d "/var/apps/moviepilot/share/config" ] && { echo "/var/apps/moviepilot/share/config"; return 0; }
+    return 1
+}
+
+# 从 app.env 读取指定 key 的值（最小解析：KEY=VALUE 行，去注释/引号）。
+# app.env 由 moviepilot setup 生成，含 SUPERUSER / SUPERUSER_PASSWORD / API_TOKEN 等。
+# 用途：读免登录凭据给网关桥。失败返回空（调用方容错）。
+read_env_key() {
+    local key="$1"
+    local env_file
+    env_file="$(resolve_config_dir 2>/dev/null)/app.env" || return 1
+    [ -f "${env_file}" ] || return 1
+    # awk: 跳过注释/空行，匹配 KEY=，取等号后内容，去首尾引号
+    awk -F= -v k="${key}" '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        $1 == k {
+            v = substr($0, index($0, "=") + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            if (v ~ /^".*"$/ || v ~ /^'"'"'.*'"'"'$/) v = substr(v, 2, length(v) - 2)
+            print v
+            exit
+        }
+    ' "${env_file}"
+}
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "${INSTALL_LOG}" 2>/dev/null
+}
+
+# --------------------------------------------------------------------------
+# 端口探测：TCP 能否建连（不发送数据，只测 connect 是否成功）
+# 用途：stop 后确认端口释放、start 前确认端口未被占。
+#   后端 :3001（FastAPI）、前端 :3000（service.js）。
+#   桥/网关走 Unix socket，不走 TCP 端口，不在此探测范围。
+# --------------------------------------------------------------------------
+port_open() {
+    local port="$1"
+    # /dev/tcp 是 bash 特性，connect 失败会返回非零
+    (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null && { exec 3>&- 3<&-; return 0; } || return 1
+}
+
+# 等端口释放（轮询，最多 wait 秒）。
+# stop 后后端进程可能还在做优雅退出（flush 数据库、关连接池），端口不会瞬间释放。
+# 不等透就返回成功 → fnOS 判定已停 → 用户点启动 → moviepilot start 检测端口仍被占
+# → 报 "running-unmanaged"（端口上有进程但 runtime JSON 已清）→ 启动失败。
+wait_port_closed() {
+    local port="$1" wait="${2:-30}" label="${3:-端口}"
+    local i
+    for ((i = 0; i < wait; i++)); do
+        port_open "${port}" || { log_msg "${label} :${port} 已释放（等待 ${i}s）"; return 0; }
+        sleep 1
+    done
+    log_msg "[WARN] ${label} :${port} 在 ${wait}s 后仍未释放"
+    return 1
+}
+
+# 强制清理占用端口的残留进程（stop 超时兜底）。
+# 策略：按端口找进程（lsof/fuser/ss 兜底），SIGKILL。
+#   场景：moviepilot stop --timeout 30 超时（后端没在 30s 内退），进程还在占端口。
+#   不强制 kill 的话，下次 start 必报 "端口已被占用"。
+force_kill_port() {
+    local port="$1" label="${2:-进程}"
+    local pids=""
+    # 优先 lsof（最准），失败试 fuser，再失败试 ss
+    if command -v lsof >/dev/null 2>&1; then
+        pids="$(lsof -ti :${port} -sTCP:LISTEN 2>/dev/null)"
+    elif command -v fuser >/dev/null 2>&1; then
+        pids="$(fuser ${port}/tcp 2>/dev/null)"
+    elif command -v ss >/dev/null 2>&1; then
+        # ss 输出形如：users:(("python",pid=12345,fd=3))
+        # 用 sed 提取 pid= 后的数字（兼容 BusyBox grep 无 -P 的情况）
+        pids="$(ss -lntp 2>/dev/null | grep ":${port} " | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u)"
+    fi
+    if [ -n "${pids}" ]; then
+        log_msg "[FORCE] 强制终止占用 :${port} 的 ${label} 残留进程：$(echo ${pids} | tr '\n' ' ')"
+        for pid in ${pids}; do
+            kill -KILL "${pid}" 2>/dev/null || true
+        done
+        sleep 2
+        # 二次确认
+        if port_open "${port}"; then
+            log_msg "[WARN] 强制 kill 后 :${port} 仍被占用，可能需要手动排查"
+            return 1
+        fi
+        log_msg "${label} :${port} 残留进程已清理"
+        return 0
+    fi
+    # 找不到 pid 但端口仍被占（罕见：进程权限不可见）
+    if port_open "${port}"; then
+        log_msg "[WARN] :${port} 仍被占用但无法定位 pid（权限不足？），跳过强制清理"
+        return 1
+    fi
+    return 0
+}
+
+# 设置 MoviePilot 运行所需环境
+prepare_env() {
+    [ -x "${MP_ROOT}/moviepilot" ] || {
+        echo "MoviePilot 未安装：${MP_ROOT}/moviepilot 不存在" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+        exit 1
+    }
+    export CONFIG_DIR
+    CONFIG_DIR="$(resolve_config_dir)" || {
+        echo "无法定位配置目录（TRIM_DATA_SHARE_PATHS）" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+        exit 1
+    }
+    # Node 兜底：app.cli 的 _frontend_node_binary 优先用 .runtime/node/bin/node，
+    # 失败再 shutil.which("node")。这里把自带 Node 加进 PATH 兜底。
+    # LOCAL_BIN_DIR 在最前：装了 curl shim，让 moviepilot update（网页"更新"按钮
+    # 触发的独立子进程，继承本 PATH）的 GitHub 请求走 gh-proxy 加速。
+    export PATH="${LOCAL_BIN_DIR}:${NODE_RUNTIME_BIN}:${PATH}"
+    # HOME / CloakBrowser 内核目录：与 install_callback 保持一致，
+    # 否则运行时 cloakbrowser 会再次尝试下载内核到不存在的 /home/<user>。
+    export HOME="${TRIM_PKGHOME:-${TRIM_PKGVAR}}"
+    export CLOAKBROWSER_CACHE_DIR="${TRIM_PKGVAR}/cloakbrowser-cache"
+    # 开启 start 时自动更新：每次启动检查并拉取最新版本（gh-proxy clone 的
+    # insteadOf 让 git pull 走镜像，curl shim 让前端 dist.zip 下载走 gh-proxy，
+    # 国内 NAS 约 2 分钟完成）。已实测 v2.15.4 → v2.15.5 升级链路跑通。
+    # 取值由安装向导/应用设置写入 app.env（MOVIEPILOT_AUTO_UPDATE），这里读取后 export
+    # 传给 moviepilot CLI。未配置时默认开启。
+    local auto_update
+    auto_update="$(read_env_key MOVIEPILOT_AUTO_UPDATE 2>/dev/null)"
+    if [ -n "${auto_update}" ]; then
+        export MOVIEPILOT_AUTO_UPDATE="${auto_update}"
+        log_msg "自动更新：MOVIEPILOT_AUTO_UPDATE=${auto_update}"
+    else
+        export MOVIEPILOT_AUTO_UPDATE=true
+        log_msg "自动更新：MOVIEPILOT_AUTO_UPDATE=true（app.env 未设置，用默认）"
+    fi
+    cd "${MP_ROOT}" || exit 1
+}
+
+# 启动 fnOS 统一网关反向代理桥。
+# 前提：前端 :3000 已可服务（调用方在 ./moviepilot start 成功后调用）。
+# 幂等：若已有桥进程在跑且 socket 存在，直接返回。
+# 免登录凭据：从 app.env 读 SUPERUSER/SUPERUSER_PASSWORD（setup 时写入），注入给桥。
+#   桥拿这个走 /api/v1/login/access-token 换 JWT，注入到 SPA 前端实现网关路径免登录。
+#   未读到（app.env 缺失/字段空）则 BRIDGE_LOGIN_USER 留空，桥关闭免登录，前端走正常登录。
+start_gateway_bridge() {
+    [ -f "${GATEWAY_BRIDGE}" ] || {
+        echo "网关桥缺失：${GATEWAY_BRIDGE}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+        return 1
+    }
+    # 已在运行则跳过
+    if [ -f "${GATEWAY_PID}" ] && kill -0 "$(cat "${GATEWAY_PID}" 2>/dev/null)" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "${GATEWAY_PID}"
+
+    # 读取免登录凭据（app.env 的 SUPERUSER/SUPERUSER_PASSWORD）
+    local login_user login_pass
+    login_user="$(read_env_key SUPERUSER 2>/dev/null)"
+    login_pass="$(read_env_key SUPERUSER_PASSWORD 2>/dev/null)"
+    if [ -n "${login_user}" ] && [ -n "${login_pass}" ]; then
+        log_msg "Starting gateway-bridge (autologin=${login_user}) ..."
+    else
+        log_msg "Starting gateway-bridge (autologin=off, app.env 缺少凭据) ..."
+    fi
+
+    GATEWAY_PREFIX="${GATEWAY_PREFIX}" \
+    LISTEN_SOCKET="${GATEWAY_SOCK}" \
+    UPSTREAM_HOST="127.0.0.1" UPSTREAM_PORT="3000" \
+    BRIDGE_LOGIN_USER="${login_user}" \
+    BRIDGE_LOGIN_PASS="${login_pass}" \
+    BRIDGE_LOG="${GATEWAY_LOG}" \
+      nohup "${NODE_RUNTIME_BIN}/node" "${GATEWAY_BRIDGE}" >> "${GATEWAY_LOG}" 2>&1 &
+    local pid=$!
+    echo "${pid}" > "${GATEWAY_PID}"
+    # 等待 socket 出现（桥内部会先等前端就绪再 listen，给足时间）
+    local i
+    for ((i = 0; i < 60; i++)); do
+        [ -S "${GATEWAY_SOCK}" ] && { log_msg "gateway-bridge ready (pid=${pid}, sock=${GATEWAY_SOCK})"; return 0; }
+        kill -0 "${pid}" 2>/dev/null || { log_msg "[ERROR] gateway-bridge exited early"; return 1; }
+        sleep 1
+    done
+    log_msg "[ERROR] gateway-bridge socket 未出现（60s），见 ${GATEWAY_LOG}"
+    return 1
+}
+
+# 停止网关桥并清理 socket。
+stop_gateway_bridge() {
+    if [ -f "${GATEWAY_PID}" ]; then
+        local pid
+        pid="$(cat "${GATEWAY_PID}" 2>/dev/null)"
+        if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+            kill -TERM "${pid}" 2>/dev/null
+            local i
+            for ((i = 0; i < 10; i++)); do
+                kill -0 "${pid}" 2>/dev/null || break
+                sleep 1
+            done
+            kill -0 "${pid}" 2>/dev/null && kill -KILL "${pid}" 2>/dev/null || true
+            log_msg "gateway-bridge stopped (pid=${pid})"
+        fi
+        rm -f "${GATEWAY_PID}"
+    fi
+    rm -f "${GATEWAY_SOCK}"
+}
+
+do_start() {
+    prepare_env
+
+    # 预检端口：上次 stop 可能没干净（极端竞态：进程被 OOM kill / kill -9 残留），
+    # 或用户手动拉起过残留进程。端口被占时 moviepilot start 会报
+    # "running-unmanaged" 拒绝启动。这里先清理，再启动。
+    # 注意：只在 runtime JSON 不认这些进程时才清理（正常运行中 start 由 fnOS
+    # 通过 status 判定拦截，不会走到这里；走到这里的 start 都是"已停→重启"）。
+    if port_open "${BACKEND_PORT}"; then
+        log_msg "[WARN] 启动前检测到后端 :${BACKEND_PORT} 被占用，清理残留进程"
+        force_kill_port "${BACKEND_PORT}" "后端"
+    fi
+    if port_open "${FRONTEND_PORT}"; then
+        log_msg "[WARN] 启动前检测到前端 :${FRONTEND_PORT} 被占用，清理残留进程"
+        force_kill_port "${FRONTEND_PORT}" "前端"
+    fi
+
+    log_msg "Starting MoviePilot ..."
+    # CLI spawn 后端+前端为分离进程，健康检查通过后返回 0
+    if ./moviepilot start --timeout 120 >> "${INSTALL_LOG}" 2>&1; then
+        log_msg "MoviePilot started (frontend :3000, backend :3001)"
+    else
+        log_msg "[ERROR] MoviePilot start failed"
+        echo "MoviePilot 启动失败，详见 ${INSTALL_LOG}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+        return 1
+    fi
+    # 前端就绪后拉起网关桥，监听 ${TRIM_APPDEST}/app.sock
+    if ! start_gateway_bridge; then
+        echo "网关桥启动失败，详见 ${GATEWAY_LOG}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+        # 回滚：停掉已启动的 MoviePilot，避免半启动状态（MP 在跑但网关入口不可用）
+        log_msg "[ROLLBACK] 网关桥失败，停止 MoviePilot ..."
+        ./moviepilot stop --timeout 30 --force >> "${INSTALL_LOG}" 2>&1 || true
+        return 1
+    fi
+    return 0
+}
+
+do_stop() {
+    prepare_env
+    # 先停网关桥（不再接受新请求），再停 MoviePilot
+    stop_gateway_bridge
+    log_msg "Stopping MoviePilot ..."
+    # moviepilot stop 先优雅停（SIGTERM + 30s）。
+    # --force 兜底：超时未退则 SIGKILL。不 force 的话，30s 没退会抛异常退出，
+    # 进程仍在跑占着端口，下次 start 报 "running-unmanaged"。
+    ./moviepilot stop --timeout 30 --force >> "${INSTALL_LOG}" 2>&1
+    local rc=$?
+
+    # 即使 moviepilot stop 返回成功，也要确认端口真正释放：
+    #   ① 后端 uvicorn 多 worker，主进程退了 worker 可能还在收尾
+    #   ② --force 的 SIGKILL 后端口释放有延迟（内核 TIME_WAIT）
+    #   ③ 极端情况 runtime JSON 已清但进程没被 kill 到（pid 对不上）
+    # 端口没释放就返回 → fnOS 判定已停 → 用户点启动 → 端口冲突报错。
+    # 这里轮询 + 兜底强杀，彻底堵住这个竞态。
+    wait_port_closed "${BACKEND_PORT}" 15 "后端" || {
+        log_msg "moviepilot stop 后后端端口未释放，强制清理残留进程"
+        force_kill_port "${BACKEND_PORT}" "后端"
+    }
+    wait_port_closed "${FRONTEND_PORT}" 10 "前端" || {
+        log_msg "moviepilot stop 后前端端口未释放，强制清理残留进程"
+        force_kill_port "${FRONTEND_PORT}" "前端"
+    }
+
+    log_msg "MoviePilot stop done (cli rc=${rc}, ports cleared)"
+    return 0
+}
+
+do_status() {
+    # 双探测：前端 :3000 在服务 且 网关 socket 存在（桥在跑）才算运行中。
+    # 任一缺失说明网关入口不可用，报告未运行以便 fnOS 触发重启。
+    if curl -sf --connect-timeout 2 http://127.0.0.1:3000/version.txt >/dev/null 2>&1 \
+       && [ -S "${GATEWAY_SOCK}" ]; then
+        exit 0
+    fi
+    exit 3
+}
+
+case "$1" in
+start)
+    do_start
+    ;;
+stop)
+    do_stop
+    ;;
+status)
+    do_status
+    ;;
+*)
+    echo "用法：$0 {start|stop|status}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+    exit 1
+    ;;
+esac

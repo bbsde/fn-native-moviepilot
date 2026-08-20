@@ -1,0 +1,189 @@
+#!/bin/bash
+#
+# config_callback — 用户在应用设置页提交配置后调用（root 身份）
+#
+# 处理：网桥免登录账号绑定（wizard_superuser / wizard_password）
+#   用户在应用设置页（wizard/config 向导）填入的账号密码，写入 app.env 的
+#   SUPERUSER / SUPERUSER_PASSWORD。网关桥（gateway-bridge.js）启动时读这两个
+#   字段，用它走 /api/v1/login/access-token 换 JWT，注入前端 SPA 实现免登录。
+#
+#   场景：用户在 MoviePilot 网页改了密码后，需在此同步更新免登录密码，否则
+#   桥用旧密码登录失败，免登录降级为手动登录。
+#
+#   留空语义：wizard 字段留空 = 不修改当前值（保留 app.env 现有内容）。
+#
+# 幂等：重复执行不破坏数据。仅在字段非空时才写 app.env。
+# 改完后重启应用：让桥重新读凭据 + 用新密码登录。
+
+set -uo pipefail
+
+# ===== fnOS 运行上下文 =====
+APP_DEST="${TRIM_APPDEST}"
+DATA_DIR="${TRIM_PKGVAR}"
+HOME_DIR="${TRIM_PKGHOME}"
+APP_USER="${TRIM_USERNAME:-moviepilot}"
+APP_GROUP="${TRIM_GROUPNAME:-moviepilot}"
+
+CONFIG_LOG="${DATA_DIR}/config.log"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | $*" | tee -a "${CONFIG_LOG}" 2>/dev/null || \
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | $*"
+}
+
+# 从共享区定位 config 目录（与 install_callback / main 一致）
+resolve_config_dir() {
+    local paths="${TRIM_DATA_SHARE_PATHS:-}"
+    local p
+    if [ -n "${paths}" ]; then
+        local IFS=':'
+        for p in ${paths}; do
+            if [ -n "${p}" ] && echo "${p}" | grep -Eq '/config/?$'; then
+                echo "${p}"
+                return 0
+            fi
+        done
+    fi
+    [ -d "/var/apps/moviepilot/share/config" ] && { echo "/var/apps/moviepilot/share/config"; return 0; }
+    return 1
+}
+
+# 最小 KEY=VALUE 写入：已存在则替换该行，不存在则追加。
+# 不引入依赖，app.env 结构简单（每行一个 KEY=VALUE）。
+write_env_key() {
+    local file="$1" key="$2" val="$3"
+    local escaped_val
+    # 转义特殊字符对 sed 替换的影响：用 | 做 sed 分隔符，转义 | 和 &
+    escaped_val="$(printf '%s' "${val}" | sed 's/[&|]/\\&/g')"
+    if grep -qE "^[[:space:]]*${key}=" "${file}"; then
+        # 已存在：替换该行（保留行尾可能的注释由用户自行管理，这里整行替换）
+        sed -i -E "s|^[[:space:]]*${key}=.*|${key}=${escaped_val}|" "${file}"
+    else
+        # 不存在：追加（确保上一行有换行）
+        [ -s "${file}" ] && [ "$(tail -c1 "${file}" 2>/dev/null)" != $'\n' ] && printf '\n' >> "${file}"
+        printf '%s=%s\n' "${key}" "${val}" >> "${file}"
+    fi
+}
+
+# --------------------------------------------------------------------------
+# 应用免登录账号变更
+# --------------------------------------------------------------------------
+setup_bridge_autologin() {
+    local wizard_user="${wizard_superuser:-}"
+    local wizard_pass="${wizard_password:-}"
+
+    # 都留空 → 用户未修改，跳过
+    if [ -z "${wizard_user}" ] && [ -z "${wizard_pass}" ]; then
+        log "免登录配置未修改（用户名密码均留空），跳过"
+        return 0
+    fi
+
+    local config_dir env_file
+    config_dir="$(resolve_config_dir 2>/dev/null)" || {
+        log "[WARN] 无法定位 config 目录，免登录配置未更新"
+        return 0
+    }
+    env_file="${config_dir}/app.env"
+    if [ ! -f "${env_file}" ]; then
+        log "[WARN] app.env 不存在（${env_file}），免登录配置未更新"
+        return 0
+    fi
+
+    local changed=0
+    if [ -n "${wizard_user}" ]; then
+        write_env_key "${env_file}" "SUPERUSER" "${wizard_user}"
+        changed=1
+        log "免登录用户名已更新：${wizard_user}"
+    fi
+    if [ -n "${wizard_pass}" ]; then
+        write_env_key "${env_file}" "SUPERUSER_PASSWORD" "${wizard_pass}"
+        changed=1
+        log "免登录密码已更新"
+    fi
+
+    if [ "${changed}" -eq 1 ]; then
+        # 改属主：app.env 在共享区，需 moviepilot 用户可读（桥经 cmd/main 以该用户跑）
+        chown "${APP_USER}:${APP_GROUP}" "${env_file}" 2>/dev/null || \
+            log "[WARN] chown ${env_file} 失败"
+        chmod 600 "${env_file}" 2>/dev/null || true  # 含密码，收紧权限
+        log "app.env 已更新，触发应用重启使免登录新凭证生效 ..."
+    fi
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# 重启应用（让 cmd/main 重新拉起，桥重新读 app.env 凭据）
+# config_callback 以 root 跑，cmd/main 需以应用用户身份执行（main 内部 prepare_env
+# 会切到正确的 PATH/HOME）。用 runuser 切换到 APP_USER 调 main stop/start。
+# --------------------------------------------------------------------------
+restart_app() {
+    local main_script="${APP_DEST}/cmd/main"
+    [ -x "${main_script}" ] || {
+        log "[WARN] cmd/main 不可执行（${main_script}），请手动重启应用"
+        return 0
+    }
+
+    log "重启应用（stop → start）..."
+    # runuser 切到应用用户，注入 fnOS 上下文变量（main 依赖 TRIM_* 系列）
+    # 这些变量在 config_callback 环境里已有，runuser 默认清环境，需显式传入。
+    runuser -u "${APP_USER}" -- env \
+        TRIM_APPDEST="${TRIM_APPDEST}" \
+        TRIM_PKGVAR="${TRIM_PKGVAR}" \
+        TRIM_PKGHOME="${TRIM_PKGHOME}" \
+        TRIM_DATA_SHARE_PATHS="${TRIM_DATA_SHARE_PATHS:-}" \
+        TRIM_USERNAME="${APP_USER}" \
+        TRIM_GROUPNAME="${APP_GROUP}" \
+        TRIM_TEMP_LOGFILE="${TRIM_TEMP_LOGFILE:-}" \
+        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        bash "${main_script}" stop >> "${CONFIG_LOG}" 2>&1 || \
+        log "[WARN] stop 返回非零（可能本就没在跑），继续 start"
+
+    sleep 2
+
+    runuser -u "${APP_USER}" -- env \
+        TRIM_APPDEST="${TRIM_APPDEST}" \
+        TRIM_PKGVAR="${TRIM_PKGVAR}" \
+        TRIM_PKGHOME="${TRIM_PKGHOME}" \
+        TRIM_DATA_SHARE_PATHS="${TRIM_DATA_SHARE_PATHS:-}" \
+        TRIM_USERNAME="${APP_USER}" \
+        TRIM_GROUPNAME="${APP_GROUP}" \
+        TRIM_TEMP_LOGFILE="${TRIM_TEMP_LOGFILE:-}" \
+        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        bash "${main_script}" start >> "${CONFIG_LOG}" 2>&1 || {
+        log "[ERROR] 应用重启失败，请手动在应用中心启动"
+        return 0
+    }
+    log "应用已重启，配置已生效"
+}
+
+# --------------------------------------------------------------------------
+# 自动更新开关（wizard_auto_update：true/false）
+#   写入 app.env 的 MOVIEPILOT_AUTO_UPDATE，cmd/main start 时读取决定是否自动更新。
+#   留空（向导未填）= 不修改当前值。
+# --------------------------------------------------------------------------
+setup_auto_update() {
+    local val="${wizard_auto_update:-}"
+    [ -z "${val}" ] && { log "自动更新未修改（留空），跳过"; return 0; }
+
+    local config_dir env_file
+    config_dir="$(resolve_config_dir 2>/dev/null)" || {
+        log "[WARN] 无法定位 config 目录，自动更新设置未保存"
+        return 0
+    }
+    env_file="${config_dir}/app.env"
+    [ -f "${env_file}" ] || { log "[WARN] app.env 不存在，自动更新设置未保存"; return 0; }
+
+    write_env_key "${env_file}" "MOVIEPILOT_AUTO_UPDATE" "${val}"
+    chown "${APP_USER}:${APP_GROUP}" "${env_file}" 2>/dev/null || true
+    log "自动更新已设置为：${val}"
+}
+
+log "=== 应用配置变更 ==="
+setup_bridge_autologin
+setup_auto_update
+# 任一配置改了 app.env → 重启让后端/桥重读
+if [ -n "${wizard_superuser:-}${wizard_password:-}${wizard_auto_update:-}" ]; then
+    restart_app
+fi
+log "=== 配置应用完成 ==="
+exit 0
