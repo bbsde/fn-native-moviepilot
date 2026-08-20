@@ -48,5 +48,45 @@ if [ -d "${MP_ROOT}" ]; then
     rm -rf "${MP_ROOT}"
 fi
 
+# --------------------------------------------------------------------------
+# 回收目录授权（config_callback 的 setup_grant_dirs 授予的 ACL）
+#   授权记录在共享区 config/granted_dirs.txt；逐条移除应用用户的命名 ACL
+#   条目（目标递归含 default ACL，祖先链单条）。共享区若已被 fnOS 删除则跳过。
+# --------------------------------------------------------------------------
+revoke_granted_dirs() {
+    local paths="${TRIM_DATA_SHARE_PATHS:-}" p config_dir=""
+    if [ -n "${paths}" ]; then
+        local IFS=':'
+        for p in ${paths}; do
+            if [ -n "${p}" ] && echo "${p}" | grep -Eq '/config/?$'; then
+                config_dir="${p}"
+                break
+            fi
+        done
+    fi
+    [ -n "${config_dir}" ] || return 0
+    local granted_list="${config_dir}/granted_dirs.txt"
+    [ -f "${granted_list}" ] || return 0
+
+    log "回收目录授权 ..."
+    local app_user="${TRIM_USERNAME:-moviepilot}"
+    local dir anc
+    while IFS= read -r dir; do
+        [ -n "${dir}" ] && [ -d "${dir}" ] || continue
+        setfacl -R -x "u:${app_user}" "${dir}" 2>/dev/null || true
+        setfacl -R -d -x "u:${app_user}" "${dir}" 2>/dev/null || true
+        anc="${dir%/}"
+        while [ "${anc}" != "/" ] && [ -n "${anc}" ]; do
+            anc="${anc%/*}"
+            [ -z "${anc}" ] && anc="/"
+            case "${anc}" in ""|"/") break ;; esac
+            setfacl -x "u:${app_user}" "${anc}" 2>/dev/null || true
+        done
+        log "已回收：${dir}"
+    done < "${granted_list}"
+    rm -f "${granted_list}"
+}
+revoke_granted_dirs
+
 log "=== MoviePilot 已卸载（用户数据保留在共享区）==="
 exit 0
