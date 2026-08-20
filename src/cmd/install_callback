@@ -1,86 +1,53 @@
 #!/bin/bash
 #
-# install_callback — 安装 MoviePilot 后端 + 前端运行环境
+# install_callback — 释放 fpk 内置 payload 并完成离线安装
 #
 # 执行时机：fnOS 应用中心将 fpk 解压到 target 后调用本脚本（以 root 身份）。
-# 作用：把源码包部署到持久数据区，借助上游 local_setup.py 完成依赖安装、
-#       前端下载、资源配置和数据库初始化。全程无人值守。
 #
-# 幂等：重复执行不会破坏已有数据（venv、config 复用）。
+# v3 架构（零网络安装）：
+#   fpk 内置 payload.tar（src/app/payload.tar，线上构建期组装，含源码/前端/
+#   wheels/浏览器内核/资源），fnpack 解压后位于 ${TRIM_APPDEST}/payload.tar。
+#   本脚本只做释放 + 设备端 venv 离线装配 + 初始化，全程不访问外网。
+#
+# payload.tar 内容（释放到 TRIM_PKGVAR）：
+#   MoviePilot/               上游源码快照（含 public/ 前端成品、app/application/site/ 资源）
+#   wheels/                   pip wheels（--no-index 离线安装）
+#   payload.lock              精确依赖清单（name==version）
+#   payload.meta              元信息（KERNEL_VERSION / LOCK_SHA256 / UPSTREAM_TAG / ARCH）
+#   kernel/chromium-<v>.tar   CloakBrowser 内核（重组为 chromium-<v>/ 前缀的裸 tar）
+#
+# 幂等：重复执行不会破坏共享区用户数据（config/数据库在共享区，不在释放范围）。
 
 set -uo pipefail
 
 # ===== fnOS 运行上下文 =====
 APP_DEST="${TRIM_APPDEST}"
-DATA_DIR="${TRIM_PKGVAR}"              # 程序本体（源码/venv/前端），私有区 @appdata
-HOME_DIR="${TRIM_PKGHOME}"             # 应用 home 目录 @apphome，跨卸载保留
+DATA_DIR="${TRIM_PKGVAR}"              # 程序本体（源码/venv/内核），私有区 @appdata
 APP_USER="${TRIM_USERNAME:-moviepilot}"
 APP_GROUP="${TRIM_GROUPNAME:-moviepilot}"
 ERR_FILE="${TRIM_TEMP_LOGFILE}"
 
-# 持久化用户级 bin（@apphome/.local/bin，跨卸载保留）。
-# 装 curl shim：拦截 GitHub 请求转 gh-proxy，让 moviepilot update（网页更新触发）
-# 也能走加速——update 是独立进程，继承后端进程 PATH，shim 在 .local/bin 才能被命中。
-LOCAL_BIN_DIR="${HOME_DIR}/.local/bin"
-
-# Node 运行时：自带 Node standalone（不依赖 fnOS nodejs_v24 应用）。
-# 装到 HOME_DIR/nodejs（@apphome，跨卸载保留），install_node() 下载官方 prebuilt。
-NODE_DIR="${HOME_DIR}/nodejs"
-NODE_RUNTIME_BIN="${NODE_DIR}/bin"
-NODE_VERSION="v24.19.0"
-NODE_TARGET=""        # detect_arch() 填：linux-x64 | linux-arm64
-NODE_URL=""
-NODE_ARCHIVE_DIR=""
-
 INSTALL_LOG="${DATA_DIR}/install.log"
-MP_ROOT="${DATA_DIR}/MoviePilot"       # MoviePilot 运行根目录（ROOT）
+MP_ROOT="${DATA_DIR}/MoviePilot"       # MoviePilot 运行根目录（上游 ROOT）
+PAYLOAD_TAR="${APP_DEST}/payload.tar"
+WHEELS_DIR="${DATA_DIR}/wheels"
+PAYLOAD_LOCK="${DATA_DIR}/payload.lock"
+PAYLOAD_META="${DATA_DIR}/payload.meta"
+CLOAK_CACHE="${DATA_DIR}/cloakbrowser-cache"
 
-# ===== 源码仓库（git 部署，支持网页内更新）=====
-# clone v2 分支（跟踪最新），用户可通过 MoviePilot 网页或 moviepilot update 在线更新。
-#
-# MP_REPO = 官方仓库 URL（origin 必须指向它，保持上游语义；moviepilot update
-#           也只认官方 origin）。
-# 策略：clone 走 gh-proxy clone（多 GitHub 镜像并行测速选最快 + 失败回退）。
-#       gh-proxy clone 透传 git clone 全部参数、仅替换 URL 走镜像；clone 完自动把
-#       remote origin 改回官方 URL + 配 local insteadOf（官方 URL → gh-proxy 选定
-#       镜像，仅对本仓库生效，不污染全局 git）。moviepilot update fetch origin
-#       （官方 URL）时被透明重定向到镜像。全程不依赖 Gitee。
-MP_REPO="https://github.com/jxxghp/MoviePilot.git"
-MP_BRANCH="v2"
+# Node 运行时：fnOS 应用中心依赖 nodejs_v24（manifest install_dep_apps 声明，
+# 安装时自动拉取），路径固定。上游 _frontend_node_binary 优先找 .runtime/node/bin/node，
+# 我们用符号链接指过去。
+NODE_DEP_BIN="/var/apps/nodejs_v24/target/bin"
 
-# ===== 管理员账号（优先取安装向导输入，留空则用默认值兜底）=====
-# 向导字段 wizard_superuser / wizard_password 由 wizard/install 收集，作为环境变量传入。
-# 兜底默认值须满足 MoviePilot 密码强度（字母、数字、特殊字符中至少两类）。
+# ===== 管理员账号（安装向导输入，留空用默认值兜底）=====
 SUPERUSER="${wizard_superuser:-admin}"
 SUPERUSER_PASSWORD="${wizard_password:-moviepilot123}"
 
-# ===== 国内镜像源（加速国内 NAS 安装）=====
-# 注意：不要设 PIP_PROXY！该名字会被 pip 原生当作 HTTP 代理（语义冲突）。
-# 只用 PIP_INDEX_URL / UV_DEFAULT_INDEX 指定镜像 index。
-PIP_MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
-# npm 通过 npm_config_registry 环境变量切换 registry
-NPM_REGISTRY="https://registry.npmmirror.com"
-# GitHub 加速（随包分发的 gh-proxy 工具，见 https://gitee.com/rexond/gh-proxy）
-# gh-proxy 是 Go 单二进制：内部维护镜像列表 + 并行测速选最快 + 失败回退。
-# 职责：
-#   1. 源码 clone/pull —— gh-proxy clone（多镜像竞速反代 GitHub，见 deploy_source）；
-#   2. GitHub Release 文件下载 —— 上游 local_setup.py 下载前端 dist.zip、本脚本下载
-#      CloakBrowser 内核（~200MB）都用 gh-proxy download 加速。
-GH_PROXY="${APP_DEST}/bin/gh-proxy"
-
-# ===== CloakBrowser 浏览器内核（从 CloakHQ 官方 GitHub Release 下载，走 gh-proxy 加速）=====
-# MoviePilot v2 通过 pip 装 cloakbrowser 包（requirements.in: cloakbrowser~=0.4.0），
-# 但其 chromium 内核是 ~200MB 独立大文件，由 `python -m cloakbrowser install` 拉取。
-# 我们在 setup 之前把内核释放到 CLOAKBROWSER_CACHE_DIR，使 cloakbrowser install 检测到
-# 已存在而跳过联网下载。
-#
-# 版本选择：v146.0.7680.177.5 是 cloakbrowser 唯一的 **Free（免授权）** 内核；
-# v148/v150 均为 Pro（需付费 license）。无 license 时 wrapper 自动用 v146，
-# 因此即便包是 0.4.x，锁定 v146 也能正常工作。
-#
-# 下载源：CloakHQ 官方 GitHub Release，走 gh-proxy download 加速（多镜像竞速 + 失败回退直连）。
-CLOAKBROWSER_VERSION="146.0.7680.177.5"
-CLOAKBROWSER_RELEASE="https://github.com/CloakHQ/cloakbrowser/releases/download/chromium-v${CLOAKBROWSER_VERSION}/cloakbrowser-linux-x64.tar.gz"
+# ===== payload.meta 解析结果 =====
+KERNEL_VERSION=""                      # CloakBrowser 内核版本（chromium-<v>）
+LOCK_SHA256=""                         # payload.lock 哈希（升级时判断 venv 是否复用）
+UPSTREAM_TAG=""                        # 上游版本 tag
 
 # --------------------------------------------------------------------------
 # 辅助函数
@@ -91,7 +58,6 @@ log() {
 }
 
 fail() {
-    # 写入用户可见错误并退出。同时落到 install.log 便于排查。
     log "[ERROR] $*"
     if [ -n "${ERR_FILE:-}" ]; then
         echo "MoviePilot 安装失败：$*" > "${ERR_FILE}" 2>/dev/null
@@ -99,13 +65,10 @@ fail() {
     exit 1
 }
 
-# 解析共享区中 config 目录的真实物理路径。
-# TRIM_DATA_SHARE_PATHS 为冒号分隔的路径列表；声明的共享名 moviepilot/config
-# 会对应一条以 /config 结尾的路径。优先用它；找不到则回退到 share 软链。
+# 解析共享区中 config 目录的真实物理路径（与 cmd/main 保持一致）。
 resolve_config_dir() {
     local paths="${TRIM_DATA_SHARE_PATHS:-}"
     local p
-    # 1. 优先从 TRIM_DATA_SHARE_PATHS 找到以 /config 结尾者
     if [ -n "${paths}" ]; then
         local IFS=':'
         for p in ${paths}; do
@@ -115,7 +78,6 @@ resolve_config_dir() {
             fi
         done
     fi
-    # 2. 回退：share 软链
     if [ -d "/var/apps/moviepilot/share/config" ]; then
         echo "/var/apps/moviepilot/share/config"
         return 0
@@ -123,213 +85,169 @@ resolve_config_dir() {
     return 1
 }
 
-# --------------------------------------------------------------------------
-# 确保 PATH 含标准系统目录（fnOS install 环境 PATH 可能精简，不含 /usr/bin 等）。
-# gh-proxy / node / git 等子进程 exec.LookPath 按 PATH 查找可执行文件，缺目录会
-# 报 "executable file not found"。幂等：已在 PATH 的目录不重复加。
-# --------------------------------------------------------------------------
-ensure_system_path() {
-    local dir
-    for dir in /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do
-        case ":${PATH}:" in
-            *":${dir}:"*) ;;
-            *) PATH="${dir}:${PATH}" ;;
-        esac
-    done
-    export PATH
+# 读取 payload.meta 的 KEY=VALUE
+read_meta() {
+    local key="$1"
+    [ -f "${PAYLOAD_META}" ] || return 1
+    sed -n "s|^${key}=||p" "${PAYLOAD_META}" | head -1
 }
 
 # --------------------------------------------------------------------------
-# 架构探测：uname -m → Node 预编译包 triple
-#   x86_64  → linux-x64
-#   aarch64 → linux-arm64
-# 同时构建 Node 下载 URL（走 npmmirror 二进制镜像，国内比 nodejs.org 快且稳）。
+# 前置检查（含真建测试 venv：Debian 的 python3-venv 拆包可能导致 ensurepip
+# 缺失，弱检查（venv --help）测不出来，必须真建一次验证 pip 可用）
 # --------------------------------------------------------------------------
-detect_arch() {
-    local machine
-    machine="$(uname -m 2>/dev/null)"
-    case "${machine}" in
-        x86_64)   NODE_TARGET="linux-x64" ;;
-        aarch64|arm64) NODE_TARGET="linux-arm64" ;;
-        *) fail "不支持的 CPU 架构：${machine:-未知}（当前仅支持 x86_64 / aarch64）" ;;
-    esac
-    NODE_URL="https://registry.npmmirror.com/-/binary/node/${NODE_VERSION}/node-${NODE_VERSION}-${NODE_TARGET}.tar.xz"
-    NODE_ARCHIVE_DIR="node-${NODE_VERSION}-${NODE_TARGET}"
-    log "架构：${machine}（node=${NODE_TARGET}）"
-}
+VENV_BOOTSTRAP_PIP=0                    # 1 = 需用随包 pip wheel 自举
 
-# --------------------------------------------------------------------------
-# 下载 Node standalone（官方 prebuilt，自带 npm）
-# 装到 NODE_DIR（@apphome/nodejs，跨卸载保留），不依赖 fnOS nodejs_v24 应用。
-# 整体目录布局（bin/ + lib/node_modules/），npm 依赖此布局。
-# 幂等：node 已存在且版本精确匹配则跳过（重装/升级时命中）。
-# --------------------------------------------------------------------------
-install_node() {
-    log "=== 安装 Node 二进制（${NODE_VERSION}）==="
-    local node_bin="${NODE_RUNTIME_BIN}/node"
-    if [ -x "${node_bin}" ]; then
-        local cur_ver
-        cur_ver="$("${node_bin}" --version 2>/dev/null)"
-        if [ "${cur_ver}" = "${NODE_VERSION}" ]; then
-            log "Node ${NODE_VERSION} 已存在，跳过"
-            return 0
-        fi
-    fi
-
-    local tmp_dir
-    tmp_dir="$(mktemp -d)"
-    log "下载 ${NODE_URL}"
-    if ! curl -fSL --retry 3 --connect-timeout 15 -o "${tmp_dir}/node.tar.xz" "${NODE_URL}" 2>> "${INSTALL_LOG}"; then
-        rm -rf "${tmp_dir}"
-        fail "Node 二进制下载失败"
-    fi
-
-    # 解压（Node 用 .tar.xz，需 -J）。整体目录：bin/ + lib/node_modules/，npm 依赖此布局。
-    if ! tar -xJf "${tmp_dir}/node.tar.xz" -C "${tmp_dir}" 2>> "${INSTALL_LOG}"; then
-        rm -rf "${tmp_dir}"
-        fail "Node 二进制解压失败"
-    fi
-
-    # 安装到 NODE_DIR（rm -rf 旧版再 cp -a 新版，处理版本变更）
-    rm -rf "${NODE_DIR}"
-    mkdir -p "${NODE_DIR}"
-    cp -a "${tmp_dir}/${NODE_ARCHIVE_DIR}/." "${NODE_DIR}/" 2>> "${INSTALL_LOG}" || {
-        rm -rf "${tmp_dir}" "${NODE_DIR}"
-        fail "Node 安装失败"
-    }
-    rm -rf "${tmp_dir}"
-
-    # 验证版本（npm 用 #!/usr/bin/env node shebang，需 node 在 PATH 才能跑）
-    local ver npm_ver
-    ver="$("${node_bin}" --version 2>/dev/null)"
-    npm_ver="$(PATH="${NODE_RUNTIME_BIN}:${PATH}" "${NODE_RUNTIME_BIN}/npm" --version 2>/dev/null)"
-    [ -n "${ver}" ] || fail "Node 安装后无法获取版本（${node_bin}）"
-    log "Node 就绪：node ${ver}，npm ${npm_ver:-未知}（${NODE_DIR}）"
-}
-
-# --------------------------------------------------------------------------
-# 前置检查
-# --------------------------------------------------------------------------
 preflight() {
     log "=== 前置检查 ==="
     [ -n "${APP_DEST:-}" ] || fail "TRIM_APPDEST 未设置"
     [ -n "${DATA_DIR:-}" ] || fail "TRIM_PKGVAR 未设置"
+    [ -f "${PAYLOAD_TAR}" ] || fail "payload.tar 缺失：${PAYLOAD_TAR}（fpk 损坏或为占位包）"
 
-    command -v git >/dev/null 2>&1 || fail "未找到 git（git 部署模式需要 git）"
-
-    command -v python3 >/dev/null 2>&1 || fail "未找到 python3"
+    command -v python3 >/dev/null 2>&1 || fail "未找到 python3（需飞牛内置 Python 3.11+）"
     PY_VER="$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo 0)"
     PY_MAJOR="$(echo "${PY_VER}" | cut -d. -f1)"
     PY_MINOR="$(echo "${PY_VER}" | cut -d. -f2)"
     if [ "${PY_MAJOR}" -lt 3 ] || { [ "${PY_MAJOR}" -eq 3 ] && [ "${PY_MINOR}" -lt 11 ]; }; then
-        fail "需要 Python 3.11+，当前为 ${PY_VER}"
+        fail "需要 Python 3.11+，当前为 ${PY_VER}（内置 Python 版本由飞牛系统控制）"
     fi
     log "Python: ${PY_VER} ($(command -v python3))"
 
-    python3 -m venv --help >/dev/null 2>&1 || fail "python3 venv 模块不可用，无法创建虚拟环境"
+    if [ -x "${NODE_DEP_BIN}/node" ]; then
+        log "Node: $("${NODE_DEP_BIN}/node" --version 2>/dev/null)（nodejs_v24 依赖）"
+    else
+        fail "未找到 nodejs_v24 运行时：${NODE_DEP_BIN}/node（manifest install_dep_apps 未生效？）"
+    fi
+
+    # 真建测试 venv 验证 ensurepip 可用（mktemp 目录，验完即删）
+    local test_dir
+    test_dir="$(mktemp -d)"
+    if python3 -m venv "${test_dir}/t" >> "${INSTALL_LOG}" 2>&1 \
+       && [ -x "${test_dir}/t/bin/pip" ] \
+       && "${test_dir}/t/bin/pip" --version >/dev/null 2>&1; then
+        log "venv 自检通过（ensurepip 可用）"
+    else
+        VENV_BOOTSTRAP_PIP=1
+        log "[WARN] venv 自检失败（ensurepip 缺失），将用 --without-pip + 随包 pip wheel 自举"
+    fi
+    rm -rf "${test_dir}"
 
     log "前置检查通过"
 }
 
 # --------------------------------------------------------------------------
-# 校验 gh-proxy 可执行（GitHub 加速用：clone + Release 文件下载）
-# gh-proxy clone / download 子命令内部已自带多镜像竞速 + 失败回退，调用方只需保证二进制可执行。
+# 释放 payload（一遍流式落盘）
+# var 下旧内容全量丢弃重铺：payload 即唯一事实源（存量 v2 的 git 检出/旧 venv
+# 会被自然替换；共享区 config 不在释放范围，用户数据安全）。
 # --------------------------------------------------------------------------
-probe_github_mirror() {
-    log "=== 校验 gh-proxy（GitHub 加速：clone + 文件下载）==="
-    [ -x "${GH_PROXY}" ] || chmod +x "${GH_PROXY}" 2>/dev/null || true
-    if [ ! -x "${GH_PROXY}" ]; then
-        log "[WARN] gh-proxy 不可执行：${GH_PROXY}，GitHub 文件下载将回退直连/curl shim"
-        return 0
-    fi
-    log "gh-proxy 就绪：${GH_PROXY}"
-}
-# --------------------------------------------------------------------------
-# 部署源码（git clone MoviePilot v2 到 MP_ROOT，支持网页内更新）
-# clone 走 gh-proxy clone（多 GitHub 镜像并行测速选最快 + 失败回退）：
-#   gh-proxy clone 透传 git clone 全部参数、仅替换 URL 走镜像；clone 完自动把
-#   remote origin 改回官方 URL + 配 local insteadOf（官方 URL → 镜像，仅对本仓库
-#   生效，不污染全局 git）。moviepilot update fetch origin（官方 URL）时被透明
-#   重定向到镜像。全程不依赖 Gitee，直连 GitHub 官方仓库的镜像反代。
-# 幂等：MP_ROOT/.git 已存在则跳过 clone（重装时 var 原样保留，正常命中此分支）。
-# --------------------------------------------------------------------------
-deploy_source() {
-    log "=== 部署源码（gh-proxy clone）==="
+release_payload() {
+    log "=== 释放 payload（$(du -h "${PAYLOAD_TAR}" 2>/dev/null | cut -f1)）==="
     mkdir -p "${DATA_DIR}"
-
-    if [ -d "${MP_ROOT}/.git" ]; then
-        log "源码已存在（git 仓库），跳过 clone：${MP_ROOT}"
-        return 0
+    rm -rf "${MP_ROOT}" "${WHEELS_DIR}" "${DATA_DIR}/kernel"
+    rm -f "${PAYLOAD_LOCK}" "${PAYLOAD_META}"
+    if ! tar -xf "${PAYLOAD_TAR}" -C "${DATA_DIR}" >> "${INSTALL_LOG}" 2>&1; then
+        fail "payload 释放失败（payload.tar 损坏？）"
     fi
+    [ -x "${MP_ROOT}/moviepilot" ] || fail "释放后未找到 ${MP_ROOT}/moviepilot（payload 结构异常）"
+    [ -f "${PAYLOAD_LOCK}" ] || fail "释放后未找到 payload.lock"
+    [ -f "${PAYLOAD_META}" ] || fail "释放后未找到 payload.meta"
 
-    [ -x "${GH_PROXY}" ] || chmod +x "${GH_PROXY}" 2>/dev/null || true
-    if [ ! -x "${GH_PROXY}" ]; then
-        fail "gh-proxy 不可执行：${GH_PROXY}（源码 clone 依赖它）"
-    fi
+    KERNEL_VERSION="$(read_meta KERNEL_VERSION)"
+    LOCK_SHA256="$(read_meta LOCK_SHA256)"
+    UPSTREAM_TAG="$(read_meta UPSTREAM_TAG)"
+    [ -n "${KERNEL_VERSION}" ] || fail "payload.meta 缺少 KERNEL_VERSION"
+    [ -n "${LOCK_SHA256}" ] || fail "payload.meta 缺少 LOCK_SHA256"
+    log "payload 就绪：上游 ${UPSTREAM_TAG:-未知}，内核 chromium-${KERNEL_VERSION}，lock ${LOCK_SHA256:0:12}..."
 
-    # 清理旧版 gh-proxy 遗留在 /tmp 的测速缓存（旧版缓存到 os.TempDir，多应用共享
-    # 会互相污染——一个应用测速失败写空串，其他应用命中后跳过测速直连 GitHub 被墙）。
-    # 新版 gh-proxy 缓存到二进制旁（${APP_DEST}/bin/），已天然隔离，这里只清历史残留。
-    rm -f /tmp/.gh_proxy_* 2>/dev/null || true
-
-    # gh-proxy clone：透传 --depth/--branch，仅替换 URL 走多镜像竞速反代 GitHub。
-    # clone 完自动 remote set-url origin 官方 URL + local insteadOf，无需手工配。
-    # （PATH 已在 main 开头由 ensure_system_path 补全，gh-proxy 的 git 子进程能找到 git。）
-    log "gh-proxy clone：${MP_REPO} 分支 ${MP_BRANCH} → ${MP_ROOT}"
-
-    # clone 分两轮：① 默认 HTTP/2（快）② 失败则降级 HTTP/1.1 重试。
-    # 部分镜像/网络环境对 HTTP/2 帧处理有 bug（"curl 16 Error in the HTTP2 framing
-    # layer"），降级 HTTP/1.1 可绕过。用 GIT_CONFIG_* 环境变量注入（不污染全局配置）。
-    # gh-proxy spawn 的 git 子进程会继承这些环境变量。
-    local clone_ok=0
-    if timeout 600 "${GH_PROXY}" clone --depth=1 --branch "${MP_BRANCH}" \
-        "${MP_REPO}" "${MP_ROOT}" >> "${INSTALL_LOG}" 2>&1; then
-        clone_ok=1
-    else
-        log "[WARN] gh-proxy clone 失败（可能 HTTP/2 帧错误），降级 HTTP/1.1 重试 ..."
-        rm -rf "${MP_ROOT}"
-        if GIT_CONFIG_COUNT=1 \
-           GIT_CONFIG_KEY_0="http.version" \
-           GIT_CONFIG_VALUE_0="HTTP/1.1" \
-           timeout 600 "${GH_PROXY}" clone --depth=1 --branch "${MP_BRANCH}" \
-           "${MP_REPO}" "${MP_ROOT}" >> "${INSTALL_LOG}" 2>&1; then
-            clone_ok=1
-            log "HTTP/1.1 降级 clone 成功"
-        fi
-    fi
-
-    if [ "${clone_ok}" -ne 1 ]; then
-        rm -rf "${MP_ROOT}"
-        fail "gh-proxy clone 失败（HTTP/2 和 HTTP/1.1 均不可用，检查网络/镜像）"
-    fi
-    log "源码 clone 完成（gh-proxy → GitHub 镜像）"
+    # 悬空符号链接清扫：appcenter 在回调返回后会 chown 遍历 var，
+    # 一个 dangling symlink 就会 ENOENT 中止整个安装（dsh 项目实战踩坑）。
+    find "${DATA_DIR}" -xtype l -delete 2>/dev/null || true
 }
 
 # --------------------------------------------------------------------------
-# 创建 Node 符号链接（短路官方下载，省 40MB）
-# install_node_runtime 检测到 .runtime/node/bin/node 存在且版本匹配时跳过下载。
+# Node 符号链接：MP_ROOT/.runtime/node/bin/node → nodejs_v24
+# 上游 _frontend_node_binary 优先找 .runtime/node/bin/node，找不到再 which("node")。
 # --------------------------------------------------------------------------
 setup_node_symlinks() {
-    log "=== 配置 Node 运行时（复用自带 Node standalone）==="
+    log "=== 配置 Node 运行时（nodejs_v24）==="
     local link_dir="${MP_ROOT}/.runtime/node/bin"
     mkdir -p "${link_dir}"
-    ln -sfn "${NODE_RUNTIME_BIN}/node" "${link_dir}/node"
-    ln -sfn "${NODE_RUNTIME_BIN}/npm"  "${link_dir}/npm"
-    # 校验短路条件：版本号必须与 --node-version 完全一致
+    ln -sfn "${NODE_DEP_BIN}/node" "${link_dir}/node"
     local reported
-    reported="$("${link_dir}/node" --version 2>/dev/null | sed 's/^v//')"
-    if [ "${reported}" != "${NODE_VER}" ]; then
-        fail "Node 符号链接版本校验失败：${reported} != ${NODE_VER}"
-    fi
-    log "Node 符号链接就绪 → ${link_dir} → ${NODE_RUNTIME_BIN}"
+    reported="$("${link_dir}/node" --version 2>/dev/null)"
+    [ -n "${reported}" ] || fail "Node 符号链接不可用：${link_dir}/node"
+    log "Node 符号链接就绪 → ${NODE_DEP_BIN}（${reported}）"
 }
 
 # --------------------------------------------------------------------------
-# 写 .moviepilot.env（固定 CONFIG_DIR）
-# moviepilot CLI 启动时会 source 这个文件以定位配置目录。
+# 设备端 venv：离线 pip 安装（方案 A）
+# 正常路径 python3 -m venv + pip --no-index --find-links wheels；
+# ensurepip 缺失时 --without-pip + 随包 pip wheel 自举再继续。
 # --------------------------------------------------------------------------
-write_env_file() {
-    log "=== 写入配置定位文件 ==="
+create_venv() {
+    log "=== 创建虚拟环境（离线装配）==="
+    local venv_dir="${MP_ROOT}/venv"
+    local venv_python="${venv_dir}/bin/python"
+
+    rm -rf "${venv_dir}"
+    if [ "${VENV_BOOTSTRAP_PIP}" = "1" ]; then
+        python3 -m venv --without-pip "${venv_dir}" >> "${INSTALL_LOG}" 2>&1 \
+            || fail "venv 创建失败（--without-pip 模式）"
+    else
+        python3 -m venv "${venv_dir}" >> "${INSTALL_LOG}" 2>&1 \
+            || fail "venv 创建失败"
+    fi
+
+    # 兜底：即便预检通过，真建 venv 仍可能没有 pip（预检与实际环境的拆包状态
+    # 理论上一致，此处防御性复核）——补走自举路径。
+    if [ ! -x "${venv_dir}/bin/pip" ]; then
+        log "[WARN] venv 缺少 pip，执行随包 pip wheel 自举"
+        local pip_wheel
+        pip_wheel="$(ls "${WHEELS_DIR}"/pip-*.whl 2>/dev/null | head -1)"
+        [ -n "${pip_wheel}" ] || fail "随包 wheels 缺少 pip wheel，无法自举"
+        "${venv_python}" "${pip_wheel}/pip" install --no-index --find-links "${WHEELS_DIR}" pip \
+            >> "${INSTALL_LOG}" 2>&1 || fail "pip wheel 自举失败"
+    fi
+
+    log "离线安装依赖（wheels: $(ls "${WHEELS_DIR}" | wc -l) 个文件）..."
+    if ! "${venv_dir}/bin/pip" install --no-index --find-links "${WHEELS_DIR}" \
+            -r "${PAYLOAD_LOCK}" >> "${INSTALL_LOG}" 2>&1; then
+        fail "依赖离线安装失败（详见 ${INSTALL_LOG}）"
+    fi
+    [ -x "${venv_python}" ] || fail "venv python 不可用：${venv_python}"
+    log "venv 就绪：$("${venv_python}" --version 2>&1)"
+}
+
+# --------------------------------------------------------------------------
+# 释放 CloakBrowser 内核到 CLOAKBROWSER_CACHE_DIR
+# cloakbrowser ensure_binary 期望 <cache>/chromium-<v>/chrome，命中即跳过联网。
+# --------------------------------------------------------------------------
+release_kernel() {
+    log "=== 释放 CloakBrowser 内核（chromium-${KERNEL_VERSION}）==="
+    local bin_dir="${CLOAK_CACHE}/chromium-${KERNEL_VERSION}"
+    if [ -x "${bin_dir}/chrome" ]; then
+        log "内核已就绪，跳过：${bin_dir}"
+        return 0
+    fi
+    [ -f "${DATA_DIR}/kernel/chromium-${KERNEL_VERSION}.tar" ] \
+        || fail "内核包缺失：kernel/chromium-${KERNEL_VERSION}.tar"
+    mkdir -p "${CLOAK_CACHE}"
+    if ! tar -xf "${DATA_DIR}/kernel/chromium-${KERNEL_VERSION}.tar" -C "${CLOAK_CACHE}" >> "${INSTALL_LOG}" 2>&1; then
+        fail "内核释放失败"
+    fi
+    chmod +x "${bin_dir}/chrome" 2>/dev/null || true
+    [ -x "${bin_dir}/chrome" ] || fail "内核释放后未找到可执行 chrome：${bin_dir}/chrome"
+    log "内核就绪：${bin_dir}/chrome"
+}
+
+# --------------------------------------------------------------------------
+# 写 .moviepilot.env（固定 CONFIG_DIR）+ app.env 预置自动更新关闭
+# moviepilot CLI 启动时 source .moviepilot.env 定位配置目录。
+# MOVIEPILOT_AUTO_UPDATE=false：v3 默认 "release"（启动即联网更新），必须关死，
+# 唯一更新通道 = 安装新 fpk（源码快照非 git，联网更新本就走不通）。
+# --------------------------------------------------------------------------
+write_env_config() {
+    log "=== 写入配置定位与运行开关 ==="
     CONFIG_DIR="$(resolve_config_dir)" || fail "无法定位共享区 config 目录（检查 TRIM_DATA_SHARE_PATHS）"
     mkdir -p "${CONFIG_DIR}"
     log "CONFIG_DIR=${CONFIG_DIR}"
@@ -338,264 +256,72 @@ write_env_file() {
 # 固定 MoviePilot 配置目录到共享区，用户可在文件管理器中查看管理
 CONFIG_DIR=${CONFIG_DIR}
 EOF
-    log ".moviepilot.env 已写入"
-}
 
-# --------------------------------------------------------------------------
-# 安装持久化 curl shim：GitHub 请求 → gh-proxy 加速（不改 MoviePilot 源码）
-# 原理：上游 local_setup.py 用 command_exists("curl") 选 curl 下载前端 dist.zip 等。
-#       shim 拦截 github.com / api.github.com URL，转交 gh-proxy；非 GitHub URL
-#       透传给真实 curl。
-# 持久化（区别于旧的临时 shim）：装到 LOCAL_BIN_DIR（@apphome/.local/bin，跨卸载保留），
-#       cmd/main 的 prepare_env 把 LOCAL_BIN_DIR 加进 PATH 最前。这样不仅 setup 能用，
-#       moviepilot update（网页"更新"按钮触发的独立进程）继承后端进程 PATH 也能命中 shim，
-#       实现网页自动更新走 gh-proxy 加速。
-# --------------------------------------------------------------------------
-install_github_mirror_shim() {
-    [ -x "${GH_PROXY}" ] || { log "[WARN] gh-proxy 不可执行，跳过 GitHub 下载加速 shim"; return 0; }
-    mkdir -p "${LOCAL_BIN_DIR}"
-    # 真实 curl 路径（shim 透传非 GitHub 请求用；写死避免递归命中 shim 自己）
-    local real_curl="/usr/bin/curl"
-    [ -x "${real_curl}" ] || real_curl="$(command -v curl)" || real_curl="/usr/bin/curl"
-    cat > "${LOCAL_BIN_DIR}/curl" <<'EOF'
-#!/bin/bash
-# 由 fn-native-moviepilot 生成的 curl shim：GitHub 请求 → gh-proxy 加速
-#
-# 拦截两类 GitHub curl 调用（setup / update 都会触发）：
-#   A. 文件下载（前端 dist.zip、资源）：curl -fsSL <github.com-url> -o <target>
-#      → 转交 gh-proxy download（多镜像竞速 + 失败回退）
-#   B. GitHub API 查询（解析前端 release）：curl -fsSL -H ... <api.github.com-url>
-#      → api.github.com 国内不可达且公开镜像不反代 API，这里从 URL 解析出
-#        owner/repo/tag，直接伪造上游期望的 JSON（含 tag_name 和拼好的
-#        dist.zip download_url），让上游 json.loads 成功。下载阶段会再走 A。
-# 非 GitHub URL 或加速失败时，必须用【原始完整参数】透传给真实 curl（不能
-# 重组参数，否则丢 -fsSL/-H 等 flag 会让 curl 报错或上游解析失败）。
-GH_PROXY="__GH_PROXY__"
-REAL_CURL="__REAL_CURL__"
-
-# 1. 完整保存原始参数，供透传用
-orig=("$@")
-
-# 2. 从原始参数里提取 url 和 -o 的值
-url=""
-out=""
-prev=""
-for a in "$@"; do
-    case "$prev" in
-        -o|--output) out="$a"; prev=""; continue;;
-    esac
-    case "$a" in
-        -o|--output) prev="$a";;
-        -o*) out="${a#-o}";;
-        --output=*) out="${a#*=}";;
-        -*) ;;
-        *) url="$a";;                # 第一个非选项参数即 URL
-    esac
-done
-
-# 3a. api.github.com（前端 release 查询）→ 伪造 JSON，绕过不可达的 API
-#     匹配 .../repos/{owner}/{repo}/releases/tags/{tag} 或 .../releases/latest
-if printf '%s' "$url" | grep -q 'api\.github\.com/repos/'; then
-    repo="$(printf '%s' "$url" | sed -nE 's|.*/repos/([^/]+/[^/]+).*|\1|p')"
-    tag="$(printf '%s' "$url" | sed -nE 's|.*/releases/tags/(.+)|\1|p')"
-    [ -z "$tag" ] && tag="$(printf '%s' "$url" | sed -nE 's|.*/releases/latest|latest|p')"
-    if [ -n "$repo" ] && [ -n "$tag" ]; then
-        # 若是 latest，用 gh-proxy 查真实最新 tag；否则用 URL 里的 tag
-        if [ "$tag" = "latest" ] && [ -x "$GH_PROXY" ]; then
-            real_tag="$("$GH_PROXY" latest-tag "$repo" 2>/dev/null)" || real_tag=""
-            [ -n "$real_tag" ] && tag="$real_tag"
-        fi
-        dl_url="https://github.com/${repo}/releases/download/${tag}/dist.zip"
-        # 输出上游 _resolve_frontend_release 期望的最小 JSON 结构
-        printf '{"tag_name":"%s","assets":[{"name":"dist.zip","browser_download_url":"%s"}]}\n' \
-            "$tag" "$dl_url"
-        exit 0
-    fi
-    # 解析不出 repo/tag：落到直连（多半也失败，但给个机会）
-fi
-
-# 3b. github.com / githubusercontent.com（文件下载）→ gh-proxy download
-if [ -n "$url" ] && printf '%s' "$url" | grep -qE 'github\.com|githubusercontent\.com'; then
-    [ -z "$out" ] && out="$(basename "$url")"
-    path="${url#*://}"
-    path="${path#*/}"                # 去掉域名段 → owner/repo/...
-    if "$GH_PROXY" download "$path" -o "$out" 2>/dev/null; then
-        exit 0
-    fi
-    # gh-proxy 失败：落到下面真实 curl 直连
-fi
-
-# 4. 非 GitHub URL 或加速失败：原样透传【完整原始参数】
-exec "$REAL_CURL" "${orig[@]}"
-EOF
-    sed -i "s|__GH_PROXY__|${GH_PROXY}|g; s|__REAL_CURL__|${real_curl}|g" "${LOCAL_BIN_DIR}/curl"
-    chmod +x "${LOCAL_BIN_DIR}/curl"
-    log "GitHub 下载 shim 已安装：${LOCAL_BIN_DIR}/curl（github.com/api.github.com → gh-proxy）"
-}
-
-# --------------------------------------------------------------------------
-# 下载并释放 CloakBrowser 浏览器内核
-# 从 GitHub Release 下载（curl wrapper 自动走国内镜像），失败回退官方源。
-# cloakbrowser 的 ensure_binary 期望：$CLOAKBROWSER_CACHE_DIR/chromium-<ver>/chrome
-# 在 setup 之前释放到位，setup 内的 `cloakbrowser install` 检测到已存在即跳过下载。
-# --------------------------------------------------------------------------
-deploy_cloakbrowser_binary() {
-    log "=== 下载并释放 CloakBrowser 浏览器内核 ==="
-    local cache_dir="${CLOAKBROWSER_CACHE_DIR}"
-    local bin_dir="${cache_dir}/chromium-${CLOAKBROWSER_VERSION}"
-    local chrome_bin="${bin_dir}/chrome"
-
-    mkdir -p "${cache_dir}"
-
-    # 已存在且可执行则跳过（幂等）
-    if [ -x "${chrome_bin}" ]; then
-        log "内核已就绪，跳过：${chrome_bin}"
-        return 0
-    fi
-
-    # 下载内核包到临时文件：优先 gh-proxy download（多镜像竞速），失败回退真实 curl。
-    local tmp_tar="${cache_dir}/.cloakbrowser.tar.gz"
-    log "下载内核（~200MB，走 gh-proxy 镜像加速）..."
-    # 把完整 GitHub URL 转成 gh-proxy 要的 owner/repo/... 路径
-    local gh_path="${CLOAKBROWSER_RELEASE#https://github.com/}"
-    local ok=0
-    if [ -x "${GH_PROXY}" ]; then
-        if "${GH_PROXY}" download "${gh_path}" -o "${tmp_tar}" >> "${INSTALL_LOG}" 2>&1; then
-            ok=1
-        else
-            log "[WARN] gh-proxy 下载失败，回退真实 curl 直连"
-        fi
-    fi
-    if [ "${ok}" -ne 1 ]; then
-        if ! curl -fSL --retry 3 --connect-timeout 15 -o "${tmp_tar}" "${CLOAKBROWSER_RELEASE}" 2>> "${INSTALL_LOG}"; then
-            rm -f "${tmp_tar}"
-            fail "CloakBrowser 内核下载失败（gh-proxy / GitHub 直连均不可用）"
-        fi
-    fi
-
-    log "解压内核 → ${bin_dir}"
-    rm -rf "${bin_dir}"
-    mkdir -p "${bin_dir}"
-    if ! tar -xzf "${tmp_tar}" -C "${bin_dir}" 2>> "${INSTALL_LOG}"; then
-        rm -rf "${bin_dir}" "${tmp_tar}"
-        fail "解压 CloakBrowser 内核失败"
-    fi
-    rm -f "${tmp_tar}"
-    chmod +x "${chrome_bin}" 2>/dev/null || true
-    [ -x "${chrome_bin}" ] || fail "内核释放后未找到可执行 chrome：${chrome_bin}"
-    log "内核就绪：${chrome_bin}"
-}
-
-# --------------------------------------------------------------------------
-# 运行上游无人值守 setup
-# 依次完成：venv → pip 依赖 → CloakBrowser 内核 → 前端 dist + npm → 资源 → 初始化
-# --------------------------------------------------------------------------
-run_setup() {
-    log "=== 运行 MoviePilot setup（无人值守，约 10~15 分钟）==="
-    cd "${MP_ROOT}" || fail "无法进入 ${MP_ROOT}"
-
-    # Node 运行时必须进 PATH：上游 setup 调 `.runtime/node/bin/npm install`，
-    # 而 npm 脚本 shebang 是 `#!/usr/bin/env node`，需在 PATH 中能找到 node，
-    # 否则报 `env: 'node': No such file or directory`（退出码 127）。
-    export PATH="${MP_ROOT}/.runtime/node/bin:${NODE_RUNTIME_BIN}:${PATH}"
-
-    # 注入国内镜像源环境变量（不设 PIP_PROXY，避免与 pip 的 HTTP 代理语义冲突）
-    # PIP_INDEX_URL / UV_DEFAULT_INDEX → pip 与 uv 的镜像 index；npm_config_registry → npm install
-    export PIP_INDEX_URL="${PIP_MIRROR}"
-    export UV_DEFAULT_INDEX="${PIP_MIRROR}"
-    export npm_config_registry="${NPM_REGISTRY}"
-    # 安装持久化 curl shim（@apphome/.local/bin/curl）+ 挂进 PATH，让本进程的 setup
-    # 调用走加速。run_setup 以 root 跑，shim 装到 LOCAL_BIN_DIR 后由 fix_ownership 改属主；
-    # runtime cmd/main 的 prepare_env 会把 LOCAL_BIN_DIR 挂进 PATH，让 update 进程也命中。
-    install_github_mirror_shim
-    export PATH="${LOCAL_BIN_DIR}:${PATH}"
-    log "镜像源：PIP=${PIP_MIRROR}  NPM=${NPM_REGISTRY}"
-
-    # fnOS 应用用户无 /home/<user> 目录，CloakBrowser/Playwright 默认用 $HOME 下载内核会失败。
-    # 把 HOME 指向 TRIM_PKGHOME（fnOS 真实应用 home 目录），并用 CLOAKBROWSER_CACHE_DIR
-    # 把浏览器内核（~200MB）定向到持久数据区，运行时 cmd/main 保持一致才能复用。
-    export HOME="${TRIM_PKGHOME:-${DATA_DIR}}"
-    export CLOAKBROWSER_CACHE_DIR="${DATA_DIR}/cloakbrowser-cache"
-    mkdir -p "${CLOAKBROWSER_CACHE_DIR}"
-    log "HOME=${HOME}  CLOAKBROWSER_CACHE_DIR=${CLOAKBROWSER_CACHE_DIR}"
-
-    # 释放内置浏览器内核（在 setup 之前，使 cloakbrowser install 跳过联网下载）
-    deploy_cloakbrowser_binary
-
-    local setup_cmd
-    setup_cmd="./moviepilot setup \
-        --python /usr/bin/python3 \
-        --node-version ${NODE_VER} \
-        --superuser ${SUPERUSER} \
-        --superuser-password ${SUPERUSER_PASSWORD} \
-        --config-dir ${CONFIG_DIR}"
-    log "执行：${setup_cmd}"
-
-    if ! bash -c "${setup_cmd}" >> "${INSTALL_LOG}" 2>&1; then
-        fail "moviepilot setup 执行失败，详见 ${INSTALL_LOG}"
-    fi
-    log "setup 完成"
-}
-
-# --------------------------------------------------------------------------
-# 写入自动更新开关到 app.env
-# setup 不接收 auto-update 参数（默认 config.py 里是 "release"），安装向导收集的
-# wizard_auto_update（true/false）需在 setup 写完 app.env 后自行写入。
-# 取值：true = 每次启动自动更新（默认），false = 关闭。
-# --------------------------------------------------------------------------
-write_auto_update() {
-    local val="${wizard_auto_update:-true}"
     local env_file="${CONFIG_DIR}/app.env"
-    if [ ! -f "${env_file}" ]; then
-        log "[WARN] app.env 不存在（${env_file}），跳过自动更新配置"
-        return 0
-    fi
-    # 最小 KEY=VALUE 写入：已存在则替换，不存在则追加
+    touch "${env_file}"
     if grep -qE "^[[:space:]]*MOVIEPILOT_AUTO_UPDATE=" "${env_file}"; then
-        sed -i -E "s|^[[:space:]]*MOVIEPILOT_AUTO_UPDATE=.*|MOVIEPILOT_AUTO_UPDATE=${val}|" "${env_file}"
+        sed -i -E "s|^[[:space:]]*MOVIEPILOT_AUTO_UPDATE=.*|MOVIEPILOT_AUTO_UPDATE=false|" "${env_file}"
     else
         [ -s "${env_file}" ] && [ "$(tail -c1 "${env_file}" 2>/dev/null)" != $'\n' ] && printf '\n' >> "${env_file}"
-        printf 'MOVIEPILOT_AUTO_UPDATE=%s\n' "${val}" >> "${env_file}"
+        printf 'MOVIEPILOT_AUTO_UPDATE=false\n' >> "${env_file}"
     fi
-    log "MOVIEPILOT_AUTO_UPDATE=${val} 已写入 app.env"
+    log "MOVIEPILOT_AUTO_UPDATE=false 已写入 app.env"
 }
 
 # --------------------------------------------------------------------------
-# 修正属主
-# install 脚本以 root 运行；cmd/main 以 moviepilot 用户运行，需保证可读写。
+# 运行上游 init（资源已随 payload 就位，传 --skip-resources）
+# 非交互：API_TOKEN 缺失时自动生成；superuser/password 由参数预置写入 app.env
+# 并同步数据库账号。
 # --------------------------------------------------------------------------
-fix_ownership() {
-    log "=== 修正文件属主 ==="
-    # DATA_DIR (TRIM_PKGVAR) 下含 MoviePilot ROOT、cloakbrowser-cache、日志等，
-    # 运行时全部由 moviepilot 用户读写，整体 chown 最稳妥。
+run_init() {
+    log "=== 初始化 MoviePilot（${UPSTREAM_TAG}）==="
+    cd "${MP_ROOT}" || fail "无法进入 ${MP_ROOT}"
+    export PATH="${MP_ROOT}/.runtime/node/bin:${NODE_DEP_BIN}:${PATH}"
+    export HOME="${TRIM_PKGHOME:-${DATA_DIR}}"
+    export CLOAKBROWSER_CACHE_DIR="${CLOAK_CACHE}"
+
+    if ! ./moviepilot init \
+            --skip-resources \
+            --superuser "${SUPERUSER}" \
+            --superuser-password "${SUPERUSER_PASSWORD}" \
+            --config-dir "${CONFIG_DIR}" >> "${INSTALL_LOG}" 2>&1; then
+        fail "moviepilot init 失败（详见 ${INSTALL_LOG}）"
+    fi
+    log "init 完成"
+}
+
+# --------------------------------------------------------------------------
+# 收尾：删临时载荷（wheels/kernel/payload.tar），保留 payload.lock + payload.meta
+# （升级时用 LOCK_SHA256 判断 venv 复用）；修正属主。
+# --------------------------------------------------------------------------
+cleanup_and_chown() {
+    log "=== 收尾 ==="
+    rm -rf "${WHEELS_DIR}" "${DATA_DIR}/kernel" "${MP_ROOT}/wheels"
+    rm -f "${PAYLOAD_TAR}"
+    log "已清理 wheels / kernel / payload.tar"
+
+    find "${DATA_DIR}" -xtype l -delete 2>/dev/null || true
     chown -R "${APP_USER}:${APP_GROUP}" "${DATA_DIR}" 2>/dev/null || \
         log "[WARN] chown ${DATA_DIR} 失败（可能权限受限）"
     chown -R "${APP_USER}:${APP_GROUP}" "${CONFIG_DIR}" 2>/dev/null || \
         log "[WARN] chown ${CONFIG_DIR} 失败"
-    # HOME_DIR (@apphome) 含自带 Node standalone（nodejs/），运行时需执行 node + 升级。
-    chown -R "${APP_USER}:${APP_GROUP}" "${HOME_DIR}" 2>/dev/null || \
-        log "[WARN] chown ${HOME_DIR} 失败"
     log "属主修正完成：${APP_USER}:${APP_GROUP}"
 }
 
 # --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
-ensure_system_path   # 最先补全 PATH（fnOS install 环境 PATH 可能精简）
+mkdir -p "${DATA_DIR}"
 preflight
-detect_arch
-probe_github_mirror
-install_node
-# 供 setup_node_symlinks 校验 + run_setup 的 --node-version 用
-NODE_VER="$("${NODE_RUNTIME_BIN}/node" --version 2>/dev/null | sed 's/^v//')"
-deploy_source
+release_payload
 setup_node_symlinks
-write_env_file
-run_setup
-write_auto_update
-fix_ownership
+create_venv
+release_kernel
+write_env_config
+run_init
+cleanup_and_chown
 
-log "=== MoviePilot 安装完成 ==="
+log "=== MoviePilot 安装完成（离线，${UPSTREAM_TAG}）==="
 log "访问：fnOS 桌面点击 MoviePilot 图标（统一网关 /app/moviepilot）  账号：${SUPERUSER}（首次登录请改密）"
 log "配置目录：${CONFIG_DIR}"
 exit 0

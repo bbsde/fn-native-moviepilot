@@ -17,8 +17,8 @@
 set -uo pipefail
 
 MP_ROOT="${TRIM_PKGVAR}/MoviePilot"
-NODE_RUNTIME_BIN="${TRIM_PKGHOME}/nodejs/bin"
-LOCAL_BIN_DIR="${TRIM_PKGHOME}/.local/bin"
+# Node 运行时：fnOS 应用中心依赖 nodejs_v24（manifest install_dep_apps 声明）
+NODE_RUNTIME_BIN="/var/apps/nodejs_v24/target/bin"
 INSTALL_LOG="${TRIM_PKGVAR}/info.log"
 
 # fnOS 统一网关：网关把 /app/moviepilot/** 转发到 ${TRIM_APPDEST}/app.sock。
@@ -155,28 +155,24 @@ prepare_env() {
         echo "无法定位配置目录（TRIM_DATA_SHARE_PATHS）" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
         exit 1
     }
-    # Node 兜底：app.cli 的 _frontend_node_binary 优先用 .runtime/node/bin/node，
-    # 失败再 shutil.which("node")。这里把自带 Node 加进 PATH 兜底。
-    # LOCAL_BIN_DIR 在最前：装了 curl shim，让 moviepilot update（网页"更新"按钮
-    # 触发的独立子进程，继承本 PATH）的 GitHub 请求走 gh-proxy 加速。
-    export PATH="${LOCAL_BIN_DIR}:${NODE_RUNTIME_BIN}:${PATH}"
+    # Node 兜底：app.cli 的 _frontend_node_binary 优先用 .runtime/node/bin/node
+    # （install_callback 已符号链接到 nodejs_v24），失败再 shutil.which("node")。
+    # 这里把 nodejs_v24 加进 PATH 兜底。
+    export PATH="${NODE_RUNTIME_BIN}:${PATH}"
     # HOME / CloakBrowser 内核目录：与 install_callback 保持一致，
     # 否则运行时 cloakbrowser 会再次尝试下载内核到不存在的 /home/<user>。
     export HOME="${TRIM_PKGHOME:-${TRIM_PKGVAR}}"
     export CLOAKBROWSER_CACHE_DIR="${TRIM_PKGVAR}/cloakbrowser-cache"
-    # 开启 start 时自动更新：每次启动检查并拉取最新版本（gh-proxy clone 的
-    # insteadOf 让 git pull 走镜像，curl shim 让前端 dist.zip 下载走 gh-proxy，
-    # 国内 NAS 约 2 分钟完成）。已实测 v2.15.4 → v2.15.5 升级链路跑通。
-    # 取值由安装向导/应用设置写入 app.env（MOVIEPILOT_AUTO_UPDATE），这里读取后 export
-    # 传给 moviepilot CLI。未配置时默认开启。
+    # 自动更新：v3 打包为源码快照（非 git），网页内更新已无意义且默认会联网，
+    # 默认关死。app.env 有值时以它为准（保持语义：设置优先于默认）。
     local auto_update
     auto_update="$(read_env_key MOVIEPILOT_AUTO_UPDATE 2>/dev/null)"
     if [ -n "${auto_update}" ]; then
         export MOVIEPILOT_AUTO_UPDATE="${auto_update}"
-        log_msg "自动更新：MOVIEPILOT_AUTO_UPDATE=${auto_update}"
+        log_msg "自动更新：MOVIEPILOT_AUTO_UPDATE=${auto_update}（app.env）"
     else
-        export MOVIEPILOT_AUTO_UPDATE=true
-        log_msg "自动更新：MOVIEPILOT_AUTO_UPDATE=true（app.env 未设置，用默认）"
+        export MOVIEPILOT_AUTO_UPDATE=false
+        log_msg "自动更新：MOVIEPILOT_AUTO_UPDATE=false（app.env 未设置，用默认）"
     fi
     cd "${MP_ROOT}" || exit 1
 }

@@ -1,0 +1,70 @@
+# Reusable fpk build. Called by release.yml (manual dispatch). Produces
+# per-arch fpk artifacts; publishing is the caller's job.
+#
+# Each matrix leg is self-contained (source/frontend/wheels/kernel/resources
+# all assembled per-arch by scripts/assemble-payload.sh, cached under cache/).
+# fnpack comes from the official static binary (no npm needed).
+name: build-fpk
+
+on:
+  workflow_call:
+    inputs:
+      appver:
+        required: true
+        type: string
+      upstream:
+        required: true
+        type: string
+      archs:
+        required: false
+        type: string
+        default: '["x86_64"]'
+
+env:
+  FNPACK_VERSION: '1.2.3'
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(inputs.archs) }}
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            fnpack_platform: linux-amd64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            fnpack_platform: linux-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install fnpack
+        run: |
+          curl -fsSL -o /usr/local/bin/fnpack \
+            "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-${{ matrix.fnpack_platform }}"
+          chmod +x /usr/local/bin/fnpack
+
+      - name: Build fpk (${{ matrix.arch }})
+        env:
+          MP_ARCHS: ${{ matrix.arch }}
+          MP_APPVER: ${{ inputs.appver }}
+          MP_UPSTREAM: ${{ inputs.upstream }}
+        run: bash ./build.sh "$MP_UPSTREAM"
+
+      - name: Upload fpk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: moviepilot-fpk-${{ matrix.arch }}
+          path: dist/*.fpk
+          if-no-files-found: error

@@ -2,104 +2,190 @@
 #
 # upgrade_callback — fnOS 应用包（fpk）升级后执行
 #
-# 职责边界（重要）：
-#   本脚本只管「fnOS 应用包」自己的升级收尾，不管 MoviePilot 本体的更新。
-#   MoviePilot 的在线更新（后端/前端/内核）一律走上游自己的 `moviepilot update`
-#   （网页内触发或 SSH 执行），上游会自行 git pull / 重建前端 / 下载内核，
-#   本应用不接管、不重复、不干预。
-#
 # fpk 升级时发生了什么：
-#   1. fnOS 用新 fpk 覆盖 target（脚本/ICON/网关桥等），保留 var（TRIM_PKGVAR）。
-#      → MoviePilot 源码、venv、前端、cloakbrowser 内核都在 var 下，原样保留，
-#        不需要 git pull、不需要 setup 重建、不需要重下内核。
+#   1. fnOS 用新 fpk 覆盖 target（脚本/ICON/网关桥/payload.tar 等），保留 var。
 #   2. fnOS 升级前后会自动 stop/start 应用（cmd/main）。
-#   3. 本脚本以 root 身份运行，新解压的 target 文件属主是 root；
-#      而 cmd/main 以 moviepilot 用户运行，需修正属主保证可读写。
+#   3. 本脚本以 root 身份运行；appcenter 在回调返回后会 chown 遍历 var。
 #
-# 因此本脚本只做一件事：修正属主。
+# v3 语义（disposable-var）：payload 即唯一事实源，任何历史 var 内容可丢弃重铺——
+#   - MP_ROOT 全量重释放（存量 v2 的 git 检出/旧结构自然被替换）
+#   - venv 先 stash 保留：新 payload.lock 哈希与旧一致 → 复用（省 1~2GB IO）；
+#     不一致 → 丢弃重建（设备端离线装配，wheels 随新 payload 附带）
+#   - 浏览器内核：目标版本已存在即跳过释放（~500MB，避免无谓 IO）
+#   - 共享区 config（数据库/用户配置）不在释放范围，原样保留
+#
+# 升级后无需重跑 init：数据库结构迁移由上游启动时的 alembic 处理，
+# superuser/API_TOKEN 等已持久化在共享区 app.env。
 
 set -uo pipefail
 
+APP_DEST="${TRIM_APPDEST}"
+DATA_DIR="${TRIM_PKGVAR:-}"
 APP_USER="${TRIM_USERNAME:-moviepilot}"
 APP_GROUP="${TRIM_GROUPNAME:-moviepilot}"
 ERR_FILE="${TRIM_TEMP_LOGFILE}"
-DATA_DIR="${TRIM_PKGVAR:-}"
 INSTALL_LOG="${DATA_DIR}/install.log"
-HOME_DIR="${TRIM_PKGHOME:-}"
-LOCAL_BIN_DIR="${HOME_DIR}/.local/bin"
-GH_PROXY="${TRIM_APPDEST:-}/bin/gh-proxy"
+MP_ROOT="${DATA_DIR}/MoviePilot"
+PAYLOAD_TAR="${APP_DEST}/payload.tar"
+WHEELS_DIR="${DATA_DIR}/wheels"
+PAYLOAD_LOCK="${DATA_DIR}/payload.lock"
+PAYLOAD_META="${DATA_DIR}/payload.meta"
+CLOAK_CACHE="${DATA_DIR}/cloakbrowser-cache"
+VENV_STASH="${DATA_DIR}/venv.stash"
+NODE_DEP_BIN="/var/apps/nodejs_v24/target/bin"
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') | [UPGRADE] $*" | tee -a "${INSTALL_LOG}" 2>/dev/null || \
     echo "$(date '+%Y-%m-%d %H:%M:%S') | [UPGRADE] $*"
 }
 
+fail() {
+    log "[ERROR] $*"
+    if [ -n "${ERR_FILE:-}" ]; then
+        echo "MoviePilot 升级失败：$*" > "${ERR_FILE}" 2>/dev/null
+    fi
+    exit 1
+}
+
+resolve_config_dir() {
+    local paths="${TRIM_DATA_SHARE_PATHS:-}"
+    local p
+    if [ -n "${paths}" ]; then
+        local IFS=':'
+        for p in ${paths}; do
+            if [ -n "${p}" ] && echo "${p}" | grep -Eq '/config/?$'; then
+                echo "${p}"
+                return 0
+            fi
+        done
+    fi
+    if [ -d "/var/apps/moviepilot/share/config" ]; then
+        echo "/var/apps/moviepilot/share/config"
+        return 0
+    fi
+    return 1
+}
+
+read_meta() {
+    local key="$1"
+    [ -f "${PAYLOAD_META}" ] || return 1
+    sed -n "s|^${key}=||p" "${PAYLOAD_META}" | head -1
+}
+
 [ -n "${DATA_DIR}" ] || { echo "TRIM_PKGVAR 未设置" > "${ERR_FILE:-/dev/null}"; exit 1; }
 
-# fpk 升级只覆盖 target（root 属主），var（程序本体/数据）原样保留。
-# 修正 target 属主，使 moviepilot 用户运行时可读写（尤其网关桥、bin 等）。
-log "=== fpk 升级：修正属主 ==="
-if chown -R "${APP_USER}:${APP_GROUP}" "${TRIM_APPDEST}" 2>/dev/null; then
-    log "target 属主已修正：${APP_USER}:${APP_GROUP}"
+log "=== fpk 升级开始 ==="
+
+# 1. 修正 target 属主（fpk 覆盖后属主是 root，cmd/main 以 moviepilot 用户运行）
+chown -R "${APP_USER}:${APP_GROUP}" "${APP_DEST}" 2>/dev/null || \
+    log "[WARN] chown ${APP_DEST} 失败（可能权限受限）"
+[ -d "${APP_DEST}/bin" ] && chmod +x "${APP_DEST}/bin/gateway-bridge.js" 2>/dev/null || true
+
+# 清理升级前可能残留的网关 socket（旧桥未被正确 stop 时，新桥 bind 会失败）
+rm -f "${APP_DEST}/app.sock" 2>/dev/null || true
+
+# 2. 释放新 payload（venv 先 stash，重铺后按 lock 哈希决定复用或重建）
+OLD_LOCK_SHA=""
+if [ -f "${PAYLOAD_LOCK}" ]; then
+    OLD_LOCK_SHA="$(sha256sum "${PAYLOAD_LOCK}" 2>/dev/null | cut -d' ' -f1)"
+fi
+
+if [ -d "${MP_ROOT}/venv" ]; then
+    rm -rf "${VENV_STASH}"
+    mv "${MP_ROOT}/venv" "${VENV_STASH}"
+    log "已 stash 现有 venv（待 lock 比对）"
+fi
+
+KERNEL_VERSION=""
+LOCK_SHA256=""
+UPSTREAM_TAG=""
+
+if [ -f "${PAYLOAD_TAR}" ]; then
+    log "释放新 payload ..."
+    rm -rf "${MP_ROOT}" "${WHEELS_DIR}" "${DATA_DIR}/kernel"
+    rm -f "${PAYLOAD_LOCK}" "${PAYLOAD_META}"
+    tar -xf "${PAYLOAD_TAR}" -C "${DATA_DIR}" >> "${INSTALL_LOG}" 2>&1 \
+        || fail "payload 释放失败"
+    [ -x "${MP_ROOT}/moviepilot" ] || fail "释放后未找到 ${MP_ROOT}/moviepilot"
+    KERNEL_VERSION="$(read_meta KERNEL_VERSION)"
+    LOCK_SHA256="$(read_meta LOCK_SHA256)"
+    UPSTREAM_TAG="$(read_meta UPSTREAM_TAG)"
+    [ -n "${LOCK_SHA256}" ] || fail "payload.meta 缺少 LOCK_SHA256"
+    log "payload 就绪：上游 ${UPSTREAM_TAG:-未知}，内核 chromium-${KERNEL_VERSION:-?}"
 else
-    log "[WARN] chown ${TRIM_APPDEST} 失败（可能权限受限）"
-fi
-
-# 兜底：确保 bin/ 下脚本/二进制可执行（fpk 解压偶发丢执行位）
-if [ -d "${TRIM_APPDEST}/bin" ]; then
-    chmod +x "${TRIM_APPDEST}/bin/gateway-bridge.js" "${TRIM_APPDEST}/bin/gh-proxy" 2>/dev/null || true
-fi
-
-# 补装持久化 curl shim（老版本 fpk 没有此 shim，升级后补上让 moviepilot update 走 gh-proxy）。
-# 幂等：shim 已存在则跳过（避免覆盖用户可能的定制；重装走 install_callback 会重生成）。
-if [ -n "${HOME_DIR}" ] && [ -x "${GH_PROXY}" ] && [ ! -x "${LOCAL_BIN_DIR}/curl" ]; then
-    mkdir -p "${LOCAL_BIN_DIR}"
-    real_curl="/usr/bin/curl"
-    [ -x "${real_curl}" ] || real_curl="$(command -v curl 2>/dev/null)" || real_curl="/usr/bin/curl"
-    cat > "${LOCAL_BIN_DIR}/curl" <<'SHIMEOF'
-#!/bin/bash
-# 由 fn-native-moviepilot 生成的 curl shim：GitHub 请求 → gh-proxy 加速
-GH_PROXY="__GH_PROXY__"
-REAL_CURL="__REAL_CURL__"
-orig=("$@")
-url=""; out=""; prev=""
-for a in "$@"; do
-    case "$prev" in -o|--output) out="$a"; prev=""; continue;; esac
-    case "$a" in
-        -o|--output) prev="$a";; -o*) out="${a#-o}";; --output=*) out="${a#*=}";;
-        -*) ;; *) url="$a";;
-    esac
-done
-if printf '%s' "$url" | grep -q 'api\.github\.com/repos/'; then
-    repo="$(printf '%s' "$url" | sed -nE 's|.*/repos/([^/]+/[^/]+).*|\1|p')"
-    tag="$(printf '%s' "$url" | sed -nE 's|.*/releases/tags/(.+)|\1|p')"
-    [ -z "$tag" ] && tag="$(printf '%s' "$url" | sed -nE 's|.*/releases/latest|latest|p')"
-    if [ -n "$repo" ] && [ -n "$tag" ]; then
-        if [ "$tag" = "latest" ] && [ -x "$GH_PROXY" ]; then
-            real_tag="$("$GH_PROXY" latest-tag "$repo" 2>/dev/null)" || real_tag=""
-            [ -n "$real_tag" ] && tag="$real_tag"
-        fi
-        printf '{"tag_name":"%s","assets":[{"name":"dist.zip","browser_download_url":"%s"}]}\n' \
-            "$tag" "https://github.com/${repo}/releases/download/${tag}/dist.zip"
-        exit 0
+    log "[WARN] ${PAYLOAD_TAR} 不存在（fpk 未携带 payload？），保留现有程序本体"
+    if [ -d "${VENV_STASH}" ] && [ ! -d "${MP_ROOT}/venv" ]; then
+        mv "${VENV_STASH}" "${MP_ROOT}/venv"
     fi
 fi
-if [ -n "$url" ] && printf '%s' "$url" | grep -qE 'github\.com|githubusercontent\.com'; then
-    [ -z "$out" ] && out="$(basename "$url")"
-    path="${url#*://}"; path="${path#*/}"
-    if "$GH_PROXY" download "$path" -o "$out" 2>/dev/null; then exit 0; fi
-fi
-exec "$REAL_CURL" "${orig[@]}"
-SHIMEOF
-    sed -i "s|__GH_PROXY__|${GH_PROXY}|g; s|__REAL_CURL__|${real_curl}|g" "${LOCAL_BIN_DIR}/curl"
-    chmod +x "${LOCAL_BIN_DIR}/curl"
-    chown -R "${APP_USER}:${APP_GROUP}" "${LOCAL_BIN_DIR}" 2>/dev/null || true
-    log "补装 curl shim：${LOCAL_BIN_DIR}/curl"
+
+# 3. venv：lock 哈希一致 → 复用；不一致 → 离线重建
+VENV_REUSED=0
+if [ -d "${VENV_STASH}" ] && [ -n "${LOCK_SHA256}" ] && [ "${OLD_LOCK_SHA}" = "${LOCK_SHA256}" ]; then
+    rm -rf "${MP_ROOT}/venv"
+    mv "${VENV_STASH}" "${MP_ROOT}/venv"
+    VENV_REUSED=1
+    log "lock 未变化（${LOCK_SHA256:0:12}...），复用现有 venv"
+elif [ -d "${VENV_STASH}" ]; then
+    log "lock 已变化（${OLD_LOCK_SHA:0:12}... → ${LOCK_SHA256:0:12}...），重建 venv"
 fi
 
-# 兜底：清理升级前可能残留的网关 socket（旧桥未被正确 stop 时，新桥 bind 会失败）
-rm -f "${TRIM_APPDEST}/app.sock" 2>/dev/null || true
+if [ "${VENV_REUSED}" != "1" ] && [ -f "${PAYLOAD_LOCK}" ] && [ -d "${WHEELS_DIR}" ]; then
+    rm -rf "${MP_ROOT}/venv"
+    if ! python3 -m venv "${MP_ROOT}/venv" >> "${INSTALL_LOG}" 2>&1; then
+        fail "venv 重建失败"
+    fi
+    if [ ! -x "${MP_ROOT}/venv/bin/pip" ]; then
+        pip_wheel="$(ls "${WHEELS_DIR}"/pip-*.whl 2>/dev/null | head -1)"
+        [ -n "${pip_wheel}" ] || fail "随包 wheels 缺少 pip wheel，无法自举"
+        "${MP_ROOT}/venv/bin/python" "${pip_wheel}/pip" install --no-index \
+            --find-links "${WHEELS_DIR}" pip >> "${INSTALL_LOG}" 2>&1 \
+            || fail "pip wheel 自举失败"
+    fi
+    "${MP_ROOT}/venv/bin/pip" install --no-index --find-links "${WHEELS_DIR}" \
+        -r "${PAYLOAD_LOCK}" >> "${INSTALL_LOG}" 2>&1 \
+        || fail "依赖离线安装失败"
+    log "venv 重建完成"
+fi
+rm -rf "${VENV_STASH}"
 
-log "=== fpk 升级完成 ==="
-log "（MoviePilot 本体更新请通过上游 moviepilot update 进行，本脚本不介入）"
+# 4. Node 符号链接 + .moviepilot.env（payload 重铺后两者都随旧 MP_ROOT 消失，重写）
+mkdir -p "${MP_ROOT}/.runtime/node/bin"
+ln -sfn "${NODE_DEP_BIN}/node" "${MP_ROOT}/.runtime/node/bin/node"
+
+CONFIG_DIR="$(resolve_config_dir 2>/dev/null || true)"
+if [ -n "${CONFIG_DIR}" ]; then
+    mkdir -p "${CONFIG_DIR}"
+    cat > "${MP_ROOT}/.moviepilot.env" <<EOF
+# 由 fn-native-moviepilot upgrade_callback 生成
+CONFIG_DIR=${CONFIG_DIR}
+EOF
+    log "CONFIG_DIR=${CONFIG_DIR}"
+else
+    log "[WARN] 无法定位共享区 config 目录，保留 .moviepilot.env 现状"
+fi
+
+# 5. 浏览器内核：目标版本已存在即跳过
+if [ -n "${KERNEL_VERSION}" ]; then
+    if [ -x "${CLOAK_CACHE}/chromium-${KERNEL_VERSION}/chrome" ]; then
+        log "内核 chromium-${KERNEL_VERSION} 已就绪，跳过释放"
+    elif [ -f "${DATA_DIR}/kernel/chromium-${KERNEL_VERSION}.tar" ]; then
+        mkdir -p "${CLOAK_CACHE}"
+        tar -xf "${DATA_DIR}/kernel/chromium-${KERNEL_VERSION}.tar" -C "${CLOAK_CACHE}" \
+            >> "${INSTALL_LOG}" 2>&1 || fail "内核释放失败"
+        chmod +x "${CLOAK_CACHE}/chromium-${KERNEL_VERSION}/chrome" 2>/dev/null || true
+        log "内核已释放：chromium-${KERNEL_VERSION}"
+    fi
+fi
+
+# 6. 收尾：删临时载荷，保留 payload.lock/payload.meta；悬空符号链接清扫
+# （appcenter 随后会 chown 遍历 var，dangling symlink 会 ENOENT 中止升级）
+rm -rf "${WHEELS_DIR}" "${DATA_DIR}/kernel"
+rm -f "${PAYLOAD_TAR}"
+find "${DATA_DIR}" -xtype l -delete 2>/dev/null || true
+chown -R "${APP_USER}:${APP_GROUP}" "${DATA_DIR}" 2>/dev/null || \
+    log "[WARN] chown ${DATA_DIR} 失败（可能权限受限）"
+
+log "=== fpk 升级完成（${UPSTREAM_TAG:-payload 未变更}）==="
+log "（应用更新唯一通道 = 安装新版 fpk；MoviePilot 网页内更新入口已停用）"
 exit 0

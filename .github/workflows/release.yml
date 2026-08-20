@@ -1,0 +1,104 @@
+# Manual fpk release (v1: workflow_dispatch only).
+#
+# Dispatch inputs:
+#   upstream — upstream MoviePilot tag (e.g. v3.0.0); "latest" resolves via API
+#   appver   — full fpk version; default <upstream-3-seg>.1 (e.g. 3.0.0.1)
+#   archs    — JSON array string; default ["x86_64"] (add "aarch64" for dual)
+#   publish  — when true, create tag v<appver> + GitHub Release with the fpks
+#
+# auto-follow (scheduled upstream tracking) is added in a later step; this
+# workflow stays the manual path (first-day v3.0.0 quality, per plan §5).
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream:
+        description: '上游 tag（如 v3.0.0，latest=自动解析）'
+        required: true
+        default: 'latest'
+      appver:
+        description: 'fpk 完整版本（默认 <上游三段>.1，如 3.0.0.1）'
+        required: false
+        default: ''
+      archs:
+        description: '架构（JSON 数组，如 ["x86_64"] 或 ["x86_64","aarch64"]）'
+        required: false
+        default: '["x86_64"]'
+      publish:
+        description: '构建成功后发布（建 tag + Release）'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  resolve:
+    name: resolve versions
+    runs-on: ubuntu-latest
+    outputs:
+      appver: ${{ steps.ver.outputs.appver }}
+      upstream: ${{ steps.ver.outputs.upstream }}
+    steps:
+      - name: Resolve versions
+        id: ver
+        run: |
+          tag='${{ inputs.upstream }}'
+          if [ "$tag" = "latest" ] || [ -z "$tag" ]; then
+            tag="$(curl -fsSL "https://api.github.com/repos/jxxghp/MoviePilot/releases?per_page=20" \
+              | grep -o '"tag_name": *"[^"]*"' | sed 's/"tag_name": *"//;s/"//' \
+              | grep -E '^v3\.' | head -1)"
+            [ -n "$tag" ] || { echo "未找到 v3.x release" >&2; exit 1; }
+          fi
+          appver='${{ inputs.appver }}'
+          if [ -z "$appver" ]; then
+            appver="${tag#v}.1"
+          fi
+          echo "appver=$appver" >> "$GITHUB_OUTPUT"
+          echo "upstream=$tag" >> "$GITHUB_OUTPUT"
+          echo "resolved: appver=$appver upstream=$tag"
+
+  build:
+    name: build
+    needs: resolve
+    uses: ./.github/workflows/build-fpk.yml
+    with:
+      appver: ${{ needs.resolve.outputs.appver }}
+      upstream: ${{ needs.resolve.outputs.upstream }}
+      archs: ${{ inputs.archs }}
+
+  publish:
+    name: publish
+    needs: [resolve, build]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download fpk artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+          pattern: moviepilot-fpk-*
+          merge-multiple: true
+
+      - name: sha256 sidecars
+        run: |
+          cd dist-all
+          for f in *.fpk; do sha256sum "$f" > "$f.sha256"; done
+          ls -lh
+
+      - name: Create release with fpks
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.resolve.outputs.appver }}
+          name: MoviePilot fnOS ${{ needs.resolve.outputs.appver }}
+          body: |
+            上游版本：jxxghp/MoviePilot ${{ needs.resolve.outputs.upstream }}
+
+            - `moviepilot_*_x86.fpk` — x86_64 设备
+            - `moviepilot_*_arm.fpk` — aarch64 设备（如包含）
+            - 同名 `.sha256` 为校验文件
+
+            安装即用，全程离线；更新方式 = 下载安装新版 fpk。
+          files: dist-all/*

@@ -11,8 +11,8 @@ set -uo pipefail
 DATA_DIR="${TRIM_PKGVAR:-}"
 APP_DEST="${TRIM_APPDEST:-}"
 MP_ROOT="${DATA_DIR}/MoviePilot"
-# 自带 Node（@apphome，跨卸载保留；卸载时可能仍在也可能已被清理，路径失效不影响兜底停止）
-NODE_RUNTIME_BIN="${TRIM_PKGHOME:-}/nodejs/bin"
+# nodejs_v24（fnOS 应用中心依赖，卸载本应用不清理它）
+NODE_RUNTIME_BIN="/var/apps/nodejs_v24/target/bin"
 INSTALL_LOG="${DATA_DIR}/install.log"
 GATEWAY_PID="${DATA_DIR}/gateway-bridge.pid"
 GATEWAY_SOCK="${APP_DEST}/app.sock"
