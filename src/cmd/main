@@ -13,13 +13,15 @@
 # status：前端 :3000 与 gateway socket 双就绪才算运行中。
 #
 # 运行身份（privilege run-as: root）：本脚本以 root 运行，负责特权准备；
-# 服务进程（MoviePilot 前后端、网关桥）一律经 AS_APP_USER 降权到 moviepilot
-# 用户执行（fnOS 推荐姿势：长期对外服务保持非特权）。
+# 服务进程一律降权到 moviepilot 用户执行——MoviePilot 前后端经 AS_APP_USER
+# （runuser，同步调用随命令结束），网关桥经 setpriv exec 链（无常驻包装进程）。
+# （fnOS 推荐姿势：长期对外服务保持非特权）
 
 set -uo pipefail
 
 MP_ROOT="${TRIM_PKGVAR}/MoviePilot"
 APP_USER="${TRIM_USERNAME:-moviepilot}"
+APP_GROUP="${TRIM_GROUPNAME:-moviepilot}"
 # Node 运行时：fnOS 应用中心依赖 nodejs_v24（manifest install_dep_apps 声明）
 NODE_RUNTIME_BIN="/var/apps/nodejs_v24/target/bin"
 INSTALL_LOG="${TRIM_PKGVAR}/info.log"
@@ -222,11 +224,13 @@ start_gateway_bridge() {
         log_msg "Starting gateway-bridge (autologin=off, app.env 缺少凭据) ..."
     fi
 
-    # 降权启动桥：root 时经 runuser 以 moviepilot 运行 node；
-    # 内层 bash 先把自身 pid（exec 后即 node 的 pid）写入 pid 文件再 exec，
-    # 保证 pid 文件记录的是 node 本体（stop 才能精准 kill，而非 runuser 包装进程）。
+    # 降权启动桥：root 时用 setpriv（exec 式降权）——进程自我降权后一路 exec
+    # 成 node，无常驻包装进程。不用 runuser：它会作为父进程常驻，且其 cmdline
+    # 含 BRIDGE_LOGIN_PASS，而 /proc/<pid>/cmdline 全局可读 → 密码对本地所有
+    # 用户暴露。整条 exec 链（setpriv→env→bash→nohup→node）保持同一 pid，
+    # 内层 bash 写入的 $$ 即 node 本体 pid（stop 才能精准 kill）。
     if [ "$(id -un)" = "root" ]; then
-        runuser -u "${APP_USER}" -- env \
+        setpriv --reuid="${APP_USER}" --regid="${APP_GROUP}" --init-groups -- env \
             GATEWAY_PREFIX="${GATEWAY_PREFIX}" \
             LISTEN_SOCKET="${GATEWAY_SOCK}" \
             UPSTREAM_HOST="127.0.0.1" UPSTREAM_PORT="3000" \
@@ -244,10 +248,22 @@ start_gateway_bridge() {
           nohup "${NODE_RUNTIME_BIN}/node" "${GATEWAY_BRIDGE}" >> "${GATEWAY_LOG}" 2>&1 &
         echo "$!" > "${GATEWAY_PID}"
     fi
-    local pid
-    pid="$(cat "${GATEWAY_PID}" 2>/dev/null)"
-    # 等待 socket 出现（桥内部会先等前端就绪再 listen，给足时间）
+    # 降权 exec 链（setpriv→env→bash）建立有延迟：后台拉起后 pid 文件并非立即可
+    # 读，直接 cat 拿到空串，kill -0 空串必失败 → 误判 "exited early" → 整个应用
+    # 被回滚。必须轮询等内层 bash 写出 pid 文件（非 root 分支由本进程同步写入，
+    # 无此问题）。
+    local pid=""
     local i
+    for ((i = 0; i < 10; i++)); do
+        pid="$(cat "${GATEWAY_PID}" 2>/dev/null)"
+        [ -n "${pid}" ] && break
+        sleep 1
+    done
+    if [ -z "${pid}" ]; then
+        log_msg "[ERROR] gateway-bridge pid 文件未出现（10s），见 ${GATEWAY_LOG}"
+        return 1
+    fi
+    # 等待 socket 出现（桥内部会先等前端就绪再 listen，给足时间）
     for ((i = 0; i < 60; i++)); do
         [ -S "${GATEWAY_SOCK}" ] && { log_msg "gateway-bridge ready (pid=${pid}, sock=${GATEWAY_SOCK})"; return 0; }
         kill -0 "${pid}" 2>/dev/null || { log_msg "[ERROR] gateway-bridge exited early"; return 1; }
@@ -306,8 +322,10 @@ do_start() {
     # 前端就绪后拉起网关桥，监听 ${TRIM_APPDEST}/app.sock
     if ! start_gateway_bridge; then
         echo "网关桥启动失败，详见 ${GATEWAY_LOG}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
-        # 回滚：停掉已启动的 MoviePilot，避免半启动状态（MP 在跑但网关入口不可用）
+        # 回滚：先停可能已拉起的桥进程（误判/半启动时桥可能是活的），
+        # 再停 MoviePilot，避免残留孤儿桥
         log_msg "[ROLLBACK] 网关桥失败，停止 MoviePilot ..."
+        stop_gateway_bridge
         AS_APP_USER ./moviepilot stop --timeout 30 --force >> "${INSTALL_LOG}" 2>&1 || true
         return 1
     fi
@@ -364,8 +382,19 @@ stop)
 status)
     do_status
     ;;
+restart-bridge)
+    # 仅重启网关桥（config_callback 免登录凭据变更后调用）：
+    # 凭据是桥启动时从环境读入的，运行中不会自更新；MoviePilot 前后端
+    # 不读 SUPERUSER/SUPERUSER_PASSWORD（密码在数据库），无需跟着重启。
+    prepare_env
+    stop_gateway_bridge
+    start_gateway_bridge || {
+        echo "网关桥重启失败，详见 ${GATEWAY_LOG}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+        exit 1
+    }
+    ;;
 *)
-    echo "用法：$0 {start|stop|status}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+    echo "用法：$0 {start|stop|status|restart-bridge}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
     exit 1
     ;;
 esac

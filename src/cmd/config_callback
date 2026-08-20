@@ -12,6 +12,11 @@
 #   2) 授权目录祖先链浏览可见性（见 sync_browse_visibility）
 #
 #   留空语义：wizard 字段留空 = 不修改当前值（保留 app.env 现有内容）。
+#
+#   值未变化时不动应用：fnOS 配置回调会把面板存量的向导字段原样回传
+#   （如「配置访问权限」变更触发的钩子），非空 ≠ 用户改了值，必须比对。
+#   真变化时也只重启网关桥（restart-bridge，秒级），MoviePilot 前后端
+#   不读这两个字段，无需全量重启。
 
 set -uo pipefail
 
@@ -63,8 +68,25 @@ write_env_key() {
     fi
 }
 
+# 从 app.env 读指定 key 当前值（与 cmd/main 的 read_env_key 同款最小解析）
+read_env_key() {
+    local key="$1" env_file="$2"
+    [ -f "${env_file}" ] || return 1
+    awk -F= -v k="${key}" '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        $1 == k {
+            v = substr($0, index($0, "=") + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            if (v ~ /^".*"$/ || v ~ /^'"'"'.*'"'"'$/) v = substr(v, 2, length(v) - 2)
+            print v
+            exit
+        }
+    ' "${env_file}"
+}
+
 # --------------------------------------------------------------------------
-# 应用免登录账号变更
+# 应用免登录账号变更（先比对现值，仅实际变化才写）
 # --------------------------------------------------------------------------
 setup_bridge_autologin() {
     local wizard_user="${wizard_superuser:-}"
@@ -87,36 +109,42 @@ setup_bridge_autologin() {
         return 0
     fi
 
+    # 与现值比对：回传的存量值与 app.env 一致 → 什么都不做（授权类钩子
+    # 触发的回调走这条路，应用保持完全无感）
     local changed=0
-    if [ -n "${wizard_user}" ]; then
+    if [ -n "${wizard_user}" ] && [ "${wizard_user}" != "$(read_env_key SUPERUSER "${env_file}")" ]; then
         write_env_key "${env_file}" "SUPERUSER" "${wizard_user}"
         changed=1
         log "免登录用户名已更新：${wizard_user}"
     fi
-    if [ -n "${wizard_pass}" ]; then
+    if [ -n "${wizard_pass}" ] && [ "${wizard_pass}" != "$(read_env_key SUPERUSER_PASSWORD "${env_file}")" ]; then
         write_env_key "${env_file}" "SUPERUSER_PASSWORD" "${wizard_pass}"
         changed=1
         log "免登录密码已更新"
     fi
-
-    if [ "${changed}" -eq 1 ]; then
-        # 改属主：app.env 在共享区，需 moviepilot 用户可读（桥经 cmd/main 以该用户跑）
-        chown "${APP_USER}:${APP_GROUP}" "${env_file}" 2>/dev/null || \
-            log "[WARN] chown ${env_file} 失败"
-        chmod 600 "${env_file}" 2>/dev/null || true  # 含密码，收紧权限
-        log "app.env 已更新，触发应用重启使免登录新凭证生效 ..."
+    if [ "${changed}" -eq 0 ]; then
+        log "免登录凭据与当前值一致，无需更新"
+        return 0
     fi
+
+    # 改属主：app.env 在共享区，需 moviepilot 用户可读（桥经 cmd/main 以该用户跑）
+    chown "${APP_USER}:${APP_GROUP}" "${env_file}" 2>/dev/null || \
+        log "[WARN] chown ${env_file} 失败"
+    chmod 600 "${env_file}" 2>/dev/null || true  # 含密码，收紧权限
+    log "app.env 已更新（免登录凭据）"
+    AUTOLOGIN_CHANGED=1
     return 0
 }
 
 # --------------------------------------------------------------------------
-# 重启应用（让 cmd/main 重新拉起，桥重新读 app.env 凭据）
-# config_callback 以 root 跑，cmd/main 需以应用用户身份执行（main 内部 prepare_env
-# 会切到正确的 PATH/HOME）。用 runuser 切换到 APP_USER 调 main stop/start。
-# 注意：cmd/ 位于应用根目录（/var/apps/<appname>/cmd），不在 target 下
-# （TRIM_APPDEST 指向 target），此处逐候选解析。
+# 重启网关桥（仅桥，不动 MoviePilot 前后端）
+#   免登录凭据是桥进程启动时从环境读入的（app.env → cmd/main 注入），运行中
+#   不会自更新，真变化后只需重启桥（秒级、网页瞬断）。SUPERUSER_PASSWORD
+#   仅桥登录用，MP 后端密码在数据库，整个应用无需重启。
+#   注意：cmd/ 位于应用根目录（/var/apps/<appname>/cmd），不在 target 下
+#   （TRIM_APPDEST 指向 target），此处逐候选解析。
 # --------------------------------------------------------------------------
-restart_app() {
+restart_bridge() {
     local main_script=""
     local cand
     for cand in "/var/apps/moviepilot/cmd/main" \
@@ -128,41 +156,17 @@ restart_app() {
         fi
     done
     [ -n "${main_script}" ] || {
-        log "[WARN] 未找到可执行的 cmd/main，请手动重启应用"
+        log "[WARN] 未找到可执行的 cmd/main，桥未重启（下次应用启动时生效）"
         return 0
     }
-
-    log "重启应用（stop → start）..."
-    # runuser 切到应用用户，注入 fnOS 上下文变量（main 依赖 TRIM_* 系列）
-    # 这些变量在 config_callback 环境里已有，runuser 默认清环境，需显式传入。
-    runuser -u "${APP_USER}" -- env \
-        TRIM_APPDEST="${TRIM_APPDEST}" \
-        TRIM_PKGVAR="${TRIM_PKGVAR}" \
-        TRIM_PKGHOME="${TRIM_PKGHOME}" \
-        TRIM_DATA_SHARE_PATHS="${TRIM_DATA_SHARE_PATHS:-}" \
-        TRIM_USERNAME="${APP_USER}" \
-        TRIM_GROUPNAME="${APP_GROUP}" \
-        TRIM_TEMP_LOGFILE="${TRIM_TEMP_LOGFILE:-}" \
-        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-        bash "${main_script}" stop >> "${CONFIG_LOG}" 2>&1 || \
-        log "[WARN] stop 返回非零（可能本就没在跑），继续 start"
-
-    sleep 2
-
-    runuser -u "${APP_USER}" -- env \
-        TRIM_APPDEST="${TRIM_APPDEST}" \
-        TRIM_PKGVAR="${TRIM_PKGVAR}" \
-        TRIM_PKGHOME="${TRIM_PKGHOME}" \
-        TRIM_DATA_SHARE_PATHS="${TRIM_DATA_SHARE_PATHS:-}" \
-        TRIM_USERNAME="${APP_USER}" \
-        TRIM_GROUPNAME="${APP_GROUP}" \
-        TRIM_TEMP_LOGFILE="${TRIM_TEMP_LOGFILE:-}" \
-        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-        bash "${main_script}" start >> "${CONFIG_LOG}" 2>&1 || {
-        log "[ERROR] 应用重启失败，请手动在应用中心启动"
+    log "重启网关桥使新凭据生效 ..."
+    # config_callback 以 root 运行，TRIM_* 环境直接继承；main 在 root 上下文
+    # 内部自行降权（桥经 setpriv），无需此处切换用户。
+    bash "${main_script}" restart-bridge >> "${CONFIG_LOG}" 2>&1 || {
+        log "[ERROR] 网关桥重启失败，详见 gateway-bridge.log（下次应用启动时兜底）"
         return 0
     }
-    log "应用已重启，配置已生效"
+    log "网关桥已重启，免登录新凭据已生效"
 }
 
 # 自动更新开关已随 v3 打包设计移除：在线更新会用上游原版文件覆盖构建期补丁，
@@ -214,9 +218,7 @@ sync_browse_visibility() {
 log "=== 应用配置变更 ==="
 sync_browse_visibility
 setup_bridge_autologin
-# 配置改了 app.env → 重启让后端/桥重读
-if [ -n "${wizard_superuser:-}${wizard_password:-}" ]; then
-    restart_app
-fi
+# 免登录凭据真的变了 → 仅重启网关桥重读凭据（MoviePilot 本体不动）
+[ "${AUTOLOGIN_CHANGED:-0}" = "1" ] && restart_bridge
 log "=== 配置应用完成 ==="
 exit 0
