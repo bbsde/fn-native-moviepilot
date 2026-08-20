@@ -497,7 +497,11 @@ fetch_wheels() {
                 done
                 rm -rf "${wtmp}"
             done < "${wheel_cache}/lock.staging"
-            # 回退补齐后重跑批量（已下载/已构建的会被跳过），确保闭包完整
+            # 回退补齐后重跑批量（已下载/已构建的会被跳过），确保闭包完整。
+            # --platform 追加 linux_${ARCH}：原生腿构建的 C 扩展轮
+            # （crcmod 等 sdist-only）标签是 linux_<arch>，不在 manylinux
+            # 兼容集内，缺了它 pip 解析阶段就判「无匹配发行版」（纯 Python
+            # any 轮不受影响，任意平台标签都兼容）。
             "${PY}" -m pip download \
                 -r "${wheel_cache}/lock.staging" \
                 --no-deps \
@@ -508,6 +512,7 @@ fetch_wheels() {
                 --platform "manylinux2014_${ARCH}" \
                 --platform "manylinux_2_17_${ARCH}" \
                 --platform "manylinux_2_28_${ARCH}" \
+                --platform "linux_${ARCH}" \
                 --find-links "${wheel_cache}" \
                 --dest "${wheel_cache}" \
                 || die "pip download 回退重试仍失败"
