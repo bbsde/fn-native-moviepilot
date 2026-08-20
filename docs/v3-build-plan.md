@@ -60,7 +60,7 @@ GitHub Actions（三个 workflow 分工，参考 fn-native-deepseek-harness 已�
         wheels: pip download                     wheels: pip download（本机平台）
           --platform manylinux2014_x86_64          （aarch64 manylinux）
           --python-version 311 --only-binary
-        生成 lock（pip freeze 精确版本集）
+        uv 生成 lock（--python-platform 按目标平台求值 marker）
         CloakBrowser 内核 .5                     内核 .3
         resources.v3 按 x86_64+cp311 过滤         按 aarch64+cp311 过滤
         组装 payload → tar -cf payload.tar（裸 tar）
@@ -83,21 +83,20 @@ NAS 安装（install_callback，零网络）
 
 运行链路不变：`cmd/main` → `moviepilot` CLI（后端 :3001 + 前端 :3000）→ `gateway-bridge.js` 监听 `${TRIM_APPDEST}/app.sock` 剥前缀转发（Node 改用 nodejs_v24）。
 
-## 4. fpk 载荷与体积（估算，首跑后精确化）
+## 4. fpk 载荷与体积（x86 实测，2026-08-20 v3.0.0）
 
-| 组成 | 体积（估） |
+| 组成 | 实测 |
 |---|---|
-| pip wheels（~200 个；langchain 全家桶 + botocore 大头；含 pip/setuptools/uv 兜底） | 300~450MB |
-| CloakBrowser 内核 tar.gz（按架构） | ~200MB |
-| 前端 public/（dist + express node_modules） | ~60MB |
-| 源码快照（无 .git） | ~10MB |
-| resources.v3（按架构过滤：对应 sites.so + user.sites.v3.bin） | ~15MB |
-| **单架构 fpk 合计** | **约 600~750MB** |
+| payload.tar（未压缩总载荷） | 987MB / 3501 条目 |
+| └ pip wheels（174 个 + lock 174 项，含 pip/wheel 兜底） | 183MB |
+| └ CloakBrowser 内核裸 tar（chromium-146.0.7680.177.5） | 729MB |
+| └ 前端 public/（dist + express node_modules）+ 源码 + 资源 | ~75MB |
+| **fpk 成品（外层 gzip 压缩后）** | **423MB** |
 
+- 估算期担心 fpk≈载荷总和（600~750MB），实测 fnpack 外层 gzip 把 987MB 压到 423MB（ELF 内核压缩率高，wheels 已压缩收益小）
+- NAS 落盘：var 稳定约 2.4GB（payload 释放 ~990MB + venv ~1.5GB + 内核解压 ~750MB；wheels 用完即删）
 - 每架构一个 fpk，互不包含；同一 release 双资产
-- payload.tar 裸打包（内容已压缩，外层压不动），fpk 体积 ≈ 各部件之和
-- NAS 落盘：安装后 var 稳定占用约 2.5~3GB（venv 1.5~2GB + 内核解压 ~500MB + 程序 ~100MB；wheels 用完即删）
-- 安装时长：SSD 卷 ~1 分钟级（v2 实测推算，工作量是 v2 安装的真子集）；HDD 卷数分钟；无网络变量
+- 安装时长：SSD 卷 ~1 分钟级（释放 + venv 装配 + init）；无网络变量
 
 ## 5. 版本方案与状态管理
 
@@ -235,3 +234,15 @@ v3 分支（新建，唯一活跃）：
 | Windows 本地构建：GNU tar 把 `D:/...` 当 `host:path` 远程语法，必须相对路径 + cwd | `pack-runtime.mjs` | 步骤 2 本地调试注意 |
 
 差异点（不照搬）：dsh 用 package.json `dshVersion` pin + bump 提交回写仓库，本方案按既定决策用 release tag 作唯一状态、不回写（§5）；dsh 载荷 gzip（`tar xzf`），本方案 payload.tar 不压缩（内容皆已压缩格式，省一遍设备端解压 CPU）。
+
+## 13. 构建实测备忘（2026-08-20 首跑踩坑，均已在 assemble-payload.sh 固化）
+
+| 坑 | 现象 | 固化的对策 |
+|---|---|---|
+| pip 跨平台下载不重算 marker | `--platform/--python-version` 只影响 wheel 标签匹配，环境 marker（sys_platform/platform_system）仍按**宿主**求值：Windows 构建机把 docker 的 `pywin32; sys_platform=="win32"` 传递依赖拉进来且无 Linux wheel | lock 用 `uv pip compile --python-platform x86_64-unknown-linux-gnu --python-version 3.11` 生成（marker 按目标平台求值） |
+| pip download 会对 lock 重走依赖图 | 即便版本全钉死，`pip download -r lock` 仍解析传递依赖 → 宿主 marker 问题复现 | 批量下载加 `--no-deps`（uv lock 已是完整闭包，按清单取 wheel 即可） |
+| 镜像源同步滞后 | uv 解析出的 langgraph-sdk 0.4.3 在阿里云镜像上还不存在 | pip/uv 一律直连 pypi.org（`MP_PYPI_INDEX` 可覆盖） |
+| sdist-only 纯 Python 依赖 | anitopy/crcmod/http-ece/oss2/pinyin2hanzi 等只发 sdist，`--only-binary` 直接失败 | 批量失败 → 逐项回退：本地 `pip wheel` 建轮，产物 plat=any 才收（C 扩展 sdist-only 明确报错走 CI Linux 腿） |
+| MSYS(noacl) 执行位 | Windows 构建机 chmod 对 ELF 无效（仅 shebang 文件自动获得执行位），内核 chrome 进 tar 变 644 | 内核树打包 `tar --mode=755` 强制统一模式 + 内层 tar 断言；moviepilot wrapper 靠 shebang 特性天然带 rwx，同样有断言兜底 |
+| 原生 Windows 工具不认 MSYS 路径 | python/uv 收到 `/d/...` 路径直接 FileNotFoundError | 所有 python/uv 调用一律「cd + 相对路径」 |
+| lock 先写会被误判缓存完整 | 解析产物先落盘，下载中断后重跑命中「已缓存」跳过 | lock 先写 `lock.staging`，下载闭包完整后才转正 |

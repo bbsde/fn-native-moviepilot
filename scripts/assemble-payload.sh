@@ -49,14 +49,19 @@ PYV="${MP_PYTHON_VERSION:-311}"
 log() { echo "[payload] $*"; }
 die() { echo "[payload][ERROR] $*" >&2; exit 1; }
 
+# pip/uv 一律直连 PyPI 本尊：镜像源存在同步滞后，uv 解析出的最新版可能
+# 在镜像上还不存在（实测 langgraph-sdk）。特殊网络环境可用 MP_PYPI_INDEX 覆盖。
+PYPI_INDEX="${MP_PYPI_INDEX:-https://pypi.org/simple}"
+export PIP_INDEX_URL="${PYPI_INDEX}"
+
 # python 命令名（Windows: python，Linux: python3）
 PY="python3"
 command -v python3 >/dev/null 2>&1 || PY="python"
 
 require_tools() {
     local t
-    for t in curl tar npm node "${PY}"; do
-        command -v "$t" >/dev/null 2>&1 || die "缺少工具：$t"
+    for t in curl tar npm node uv "${PY}"; do
+        command -v "$t" >/dev/null 2>&1 || die "缺少工具：$t（uv 可经 pip install uv 安装）"
     done
     "${PY}" -c 'import sys; assert sys.version_info >= (3, 8), "需要 Python 3.8+"' || die "Python 版本过低"
     "${PY}" -m pip --version >/dev/null 2>&1 || die "pip 不可用"
@@ -181,7 +186,7 @@ stage_resources() {
     if [ ! -d "${extract}/MoviePilot-Resources-main/resources.v3" ]; then
         rm -rf "${extract}"
         mkdir -p "${extract}"
-        (cd "${extract}" && "${PY}" -c 'import zipfile; zipfile.ZipFile("main.zip").extractall(".")') \
+        (cd "${res_cache}" && "${PY}" -c 'import zipfile; zipfile.ZipFile("main.zip").extractall("extracted")') \
             || die "resources main.zip 解压失败"
     fi
     local v3dir="${extract}/MoviePilot-Resources-main/resources.v3"
@@ -208,43 +213,117 @@ fetch_wheels() {
     if [ -f "${wheel_cache}/payload.lock" ]; then
         log "wheels 已缓存：${wheel_cache}"
     else
-        log "下载 wheels（${ARCH} cp${PYV}，~300-450MB，首次较慢）..."
-        # 过滤 Windows-only marker：本地 Windows 构建时 pip 的 platform_system
-        # 取宿主值（Windows），pywin32 会误入 lock，设备端（Linux）安装必失败
-        grep -v 'platform_system == "Windows"' \
-            "${BUILD}/payload/MoviePilot/requirements.in" > "${BUILD}/req.linux.in"
-        "${PY}" -m pip download \
-            -r "${BUILD}/req.linux.in" \
-            pip wheel \
-            --only-binary=:all: \
-            --python-version "${PYV}" \
-            --implementation cp \
-            --abi "cp${PYV}" \
-            --platform "manylinux2014_${ARCH}" \
-            --platform "manylinux_2_17_${ARCH}" \
-            --platform "manylinux_2_28_${ARCH}" \
-            --dest "${wheel_cache}" \
-            || die "pip download 失败（可能存在 sdist-only 依赖，缺 ${ARCH} wheel）"
+        log "解析依赖（uv，按目标平台 ${ARCH} cp${PYV} 求值 marker）..."
+        # pip 的跨平台下载只影响 wheel 标签匹配，环境 marker（sys_platform/
+        # platform_system）仍按宿主求值——Windows 宿主会把 docker 的
+        # pywin32 传递依赖拉进来且无 Linux wheel 可下。uv 的 --python-platform
+        # 按目标平台正确求值 marker，产出的 lock 设备端可直接 pip -r 安装。
+        local triple
+        case "${ARCH}" in
+            x86_64)  triple="x86_64-unknown-linux-gnu" ;;
+            aarch64) triple="aarch64-unknown-linux-gnu" ;;
+        esac
+        # uv 为原生二进制，路径须相对形式（同 python 的 MSYS 路径问题）
+        if ! (cd "${BUILD}" && uv pip compile "payload/MoviePilot/requirements.in" \
+                --default-index "${PYPI_INDEX}" \
+                --python-platform "${triple}" \
+                --python-version "3.11" \
+                --no-header --quiet \
+                --output-file payload.lock.raw) ; then
+            die "uv 依赖解析失败"
+        fi
+        # 去掉 '# via' 注释行，lock 只留 name==version（pip/wheel 为设备端
+        # 自举与运行时兜底额外附带）；先写 staging，全部下载成功后才转正，
+        # 避免中断后被「已缓存」分支误判为完整
+        grep -E '^[a-zA-Z0-9._-]+==' "${BUILD}/payload.lock.raw" \
+            > "${wheel_cache}/lock.staging" \
+            || die "uv lock 输出异常（无 name==version 行）"
+        printf 'pip\nwheel\n' >> "${BUILD}/payload.lock.raw"
+        (cd "${BUILD}" && uv pip compile payload.lock.raw \
+                --default-index "${PYPI_INDEX}" \
+                --python-platform "${triple}" --python-version "3.11" \
+                --no-header --quiet --output-file payload.lock.boot) \
+            || die "uv 解析 pip/wheel 兜底失败"
+        grep -E '^[a-zA-Z0-9._-]+==' "${BUILD}/payload.lock.boot" >> "${wheel_cache}/lock.staging"
+        sort -u -o "${wheel_cache}/lock.staging" "${wheel_cache}/lock.staging"
+        log "lock 就绪：$(wc -l < "${wheel_cache}/lock.staging") 项"
 
-        (cd "${wheel_cache}" && "${PY}" - > payload.lock) <<'PYEOF' || die "payload.lock 生成失败"
-import os, sys
-d = "."
-lines = []
-for f in sorted(os.listdir(d)):
-    if not f.endswith(".whl"):
-        continue
-    parts = f[:-4].split("-")
-    if len(parts) not in (5, 6):
-        sys.stderr.write(f"异常 wheel 文件名：{f}\n")
-        sys.exit(1)
-    lines.append(f"{parts[0]}=={parts[1]}")
-print("\n".join(lines))
-PYEOF
+        log "下载 wheels（${ARCH} cp${PYV}，~300-450MB，首次较慢）..."
+        # 批量下载（快路径）。--no-deps：uv lock 已是完整闭包，禁止 pip 重走
+        # 依赖图——否则宿主 marker（Windows 下 sys_platform=="win32"）会把
+        # docker 的 pywin32 传递依赖重新拉进来且无 Linux wheel 可下；
+        # --find-links 让回退阶段本地构建的 wheel 可被复用
+        if ! "${PY}" -m pip download \
+                -r "${wheel_cache}/lock.staging" \
+                --no-deps \
+                --only-binary=:all: \
+                --python-version "${PYV}" \
+                --implementation cp \
+                --abi "cp${PYV}" \
+                --platform "manylinux2014_${ARCH}" \
+                --platform "manylinux_2_17_${ARCH}" \
+                --platform "manylinux_2_28_${ARCH}" \
+                --find-links "${wheel_cache}" \
+                --dest "${wheel_cache}" ; then
+            # 回退：逐依赖排查。sdist-only 的纯 Python 包（如 anitopy）本地
+            # 构建 py3-none-any wheel 即可跨平台；C 扩展 sdist-only 则本机
+            # 跨平台建不出合法 wheel，明确报错（需 CI Linux 腿或容器构建）
+            log "[WARN] 批量下载存在 sdist-only 依赖，进入逐项回退 ..."
+            local req
+            while IFS= read -r req; do
+                [ -n "${req}" ] || continue
+                if "${PY}" -m pip download "${req}" --no-deps \
+                        --only-binary=:all: \
+                        --python-version "${PYV}" --implementation cp \
+                        --abi "cp${PYV}" \
+                        --platform "manylinux2014_${ARCH}" \
+                        --platform "manylinux_2_17_${ARCH}" \
+                        --platform "manylinux_2_28_${ARCH}" \
+                        --find-links "${wheel_cache}" \
+                        --dest "${wheel_cache}" >/dev/null 2>&1; then
+                    continue
+                fi
+                log "  sdist-only：${req} → 本地构建 wheel"
+                local wtmp="${wheel_cache}/.build"
+                rm -rf "${wtmp}"
+                mkdir -p "${wtmp}"
+                "${PY}" -m pip wheel "${req}" --no-deps -w "${wtmp}" \
+                    || die "本地构建 wheel 失败：${req}"
+                local w w_base plat
+                for w in "${wtmp}"/*.whl; do
+                    w_base="$(basename "${w}" .whl)"
+                    plat="${w_base##*-}"
+                    if [ "${plat}" = "any" ]; then
+                        mv -f "${w}" "${wheel_cache}/"
+                        log "    纯 Python wheel：$(basename "${w}")"
+                    else
+                        die "${req} 为 C 扩展 sdist-only，本机无法跨平台构建 ${ARCH} wheel（请在 Linux CI 腿构建或容器内 manylinux 化）"
+                    fi
+                done
+                rm -rf "${wtmp}"
+            done < "${wheel_cache}/lock.staging"
+            # 回退补齐后重跑批量（已下载/已构建的会被跳过），确保闭包完整
+            "${PY}" -m pip download \
+                -r "${wheel_cache}/lock.staging" \
+                --no-deps \
+                --only-binary=:all: \
+                --python-version "${PYV}" \
+                --implementation cp \
+                --abi "cp${PYV}" \
+                --platform "manylinux2014_${ARCH}" \
+                --platform "manylinux_2_17_${ARCH}" \
+                --platform "manylinux_2_28_${ARCH}" \
+                --find-links "${wheel_cache}" \
+                --dest "${wheel_cache}" \
+                || die "pip download 回退重试仍失败"
+        fi
+        # 下载闭包完整后才把 lock 转正（缓存命中判定依据）
+        mv -f "${wheel_cache}/lock.staging" "${wheel_cache}/payload.lock"
     fi
 
     rm -rf "${BUILD}/payload/wheels"
     cp -a "${wheel_cache}" "${BUILD}/payload/wheels"
-    rm -f "${BUILD}/payload/wheels/payload.lock"
+    rm -f "${BUILD}/payload/wheels/payload.lock" "${BUILD}/payload/wheels/lock.staging"
     cp -f "${wheel_cache}/payload.lock" "${BUILD}/payload/payload.lock"
     log "wheels 就位：$(ls "${BUILD}/payload/wheels" | wc -l) 个文件，lock $(wc -l < "${BUILD}/payload/payload.lock") 项"
 }
@@ -295,9 +374,13 @@ print(d[sys.argv[2]])
         fi
         local chrome="chromium-${CLOAKBROWSER_VERSION}/chrome"
         [ -f "${tmp}/stage/${chrome}" ] || die "内核包中未找到 chrome 可执行文件（结构变化？）"
-        chmod +x "${tmp}/stage/${chrome}"
+        # MSYS(noacl) 下 chmod 对 ELF 无效（仅 shebang 文件自动获得执行位），
+        # 用 tar --mode 强制内核树统一 755（应用私有目录，数据文件带执行位无害；
+        # Linux CI 上行为一致）；设备端 install_callback 释放后还会显式 chmod 兜底
         # 相对路径 + cwd 打包（Windows GNU tar 把 D:/... 当 host:path 远程语法）
-        (cd "${tmp}/stage" && tar -cf "${kernel_tar}" "chromium-${CLOAKBROWSER_VERSION}")
+        (cd "${tmp}/stage" && tar --mode=755 -cf "${kernel_tar}" "chromium-${CLOAKBROWSER_VERSION}")
+        tar -tvf "${kernel_tar}" "${chrome}" | grep -q '^[-]rwx' \
+            || die "内核 tar 中 chrome 缺少执行位"
         rm -rf "${tmp}"
     else
         log "内核已缓存：${kernel_tar}"
@@ -324,8 +407,8 @@ LOCK_SHA256=${lock_sha}
 BUILT=$(date '+%Y-%m-%d %H:%M:%S')
 EOF
 
-    # 上游 wrapper 必须可执行（MSYS 下 git 的 exec bit 会随 tar 保留，此处兜底确保）
-    chmod +x "${BUILD}/payload/MoviePilot/moviepilot"
+    # 上游 wrapper 必须可执行（MSYS 下 shebang 文件自动带执行位，tar 会保留）
+    chmod +x "${BUILD}/payload/MoviePilot/moviepilot" 2>/dev/null || true
 
     log "打包 payload.tar（未压缩）..."
     local out_rel="../payload-${ARCH}.tar"
@@ -333,12 +416,10 @@ EOF
         MoviePilot wheels payload.lock payload.meta kernel)
 
     local out="${BUILD}/payload-${ARCH}.tar"
-    # 校验关键执行位在 tar 中确实为 rwx（MSYS 权限映射异常时在此拦截）
+    # 校验关键执行位在 tar 中确实为 rwx（MSYS 权限映射异常时在此拦截）；
+    # chrome 的执行位在内层 kernel tar 中（prepare_kernel 已单独断言）
     tar -tvf "${out}" | grep -E 'MoviePilot/moviepilot$' | grep -q '^[-]rwx' \
         || die "tar 中 moviepilot wrapper 缺少执行位（MSYS 权限映射异常）"
-    local chrome_entry="kernel/chromium-${CLOAKBROWSER_VERSION}/chrome"
-    tar -tvf "${out}" | grep -E "${chrome_entry}$" | grep -q '^[-]rwx' \
-        || die "tar 中 chrome 缺少执行位"
 
     log "完成：${out}（$(du -h "${out}" | cut -f1)）"
     log "  源码 ${TAG} / 前端 ${FRONTEND_VERSION} / 内核 chromium-${CLOAKBROWSER_VERSION} / lock ${lock_sha:0:12}..."
