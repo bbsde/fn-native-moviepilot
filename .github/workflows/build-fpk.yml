@@ -55,6 +55,9 @@ jobs:
             "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-${{ matrix.fnpack_platform }}"
           chmod +x /usr/local/bin/fnpack
 
+      - name: Install uv
+        run: pip install uv
+
       - name: Build fpk (${{ matrix.arch }})
         env:
           MP_ARCHS: ${{ matrix.arch }}

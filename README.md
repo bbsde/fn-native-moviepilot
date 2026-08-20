@@ -1,105 +1,136 @@
-# fn-native-moviepilot
+<p align="center">
+  <img src="src/ICON_256.PNG" width="128" alt="MoviePilot for fnOS" />
+</p>
 
-基于飞牛 fnOS Native 框架封装的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 应用，以原生进程方式在 fnOS 上运行，提供资源搜索、订阅、整理、刮削、转移与通知等自动化媒体管理能力。
+<h1 align="center">MoviePilot for fnOS</h1>
 
-## 应用信息
+<p align="center">飞牛 fnOS 原生封装的自动化媒体管理工具 · 订阅 / 搜索 / 下载 / 整理 / 刮削 / 通知 全自动</p>
 
-| 项 | 值 |
-| --- | --- |
-| appname | `moviepilot` |
-| 运行模式 | Native 进程 |
-| 平台 | x86 |
-| 访问方式 | fnOS 统一网关 `/app/moviepilot` |
-| 数据共享 | `moviepilot/config`、`moviepilot/data` |
-| 运行用户 | `moviepilot`（package） |
-| 依赖 | `nodejs_v24`（安装时自动拉取） |
+<p align="center">
+  <a href="https://github.com/bbsde/fn-native-moviepilot/releases/latest"><img src="https://img.shields.io/github/v/release/bbsde/fn-native-moviepilot?label=Release" alt="Release"></a>
+  <a href="https://github.com/jxxghp/MoviePilot"><img src="https://img.shields.io/badge/上游-MoviePilot%20v3-0078E6" alt="Upstream"></a>
+  <img src="https://img.shields.io/badge/平台-x86%20%7C%20arm-8F9BAA" alt="Platform" />
+</p>
 
-管理员账号在安装向导中设置。若未通过向导安装，默认账号 `admin`，密码 `moviepilot123`，首次登录后请及时修改。
+---
+
+[MoviePilot](https://github.com/jxxghp/MoviePilot) 是广受欢迎的自动化媒体管理工具；本项目把它以 **fnOS Native 原生进程**方式带到飞牛 NAS 上——非 Docker、非虚拟机，安装即用。订阅想看的剧集电影，剩下的搜索、下载、识别改名、刮削海报、入库、通知，全部自动完成。
+
+## 特性亮点
+
+**📦 自包含离线安装**
+
+安装包内置全部依赖：上游源码、前端、174 个 Python wheel（按目标平台锁定）、CloakBrowser 内核、站点资源。安装**无需外网、无需 SSH、无需 Python/Node 环境**，通常 1~5 分钟完成。
+
+**🇨🇳 国内网络免代理可用**
+
+对每个外部数据源做了真机实测与默认值调优，开箱即用不依赖任何代理：
+
+| 数据源 | 状态 | 说明 |
+| --- | --- | --- |
+| TheMovieDb | ✅ 直连 | 默认走官方别名域名（0.7s 响应） |
+| 豆瓣 | ✅ 直连 | 原生可用 |
+| AniList | ✅ 直连 | 官方 API 直连，中文数据集走加速 |
+| Bangumi | ✅ 默认镜像 | 官方域名被双重封锁，默认社区镜像，可一键换回 |
+| 插件市场 / GitHub | ✅ 默认加速 | 镜像地址可更换或清空回退直连 |
+
+**🔧 打包层修复的上游缺陷**
+
+- 重启不再强制重新登录（登录态持久化）
+- 媒体服务器等配置修改后**即时生效**，无需重启应用
+- 首次安装的账号初始化崩溃已修复
+
+**🐱 飞牛深度整合**
+
+- 桌面图标打开**自动免登录**直进管理界面（局域网直连 3000 端口仍可手动登录）
+- 自带**飞牛影视**媒体服务器对接，整理完成的媒体自动同步媒体库（也支持 Emby / Jellyfin / Plex）
+- 配置与数据落在共享区，文件管理器可直接查看管理
+
+## 安装
+
+**[→ GitHub Releases（始终指向最新版）](https://github.com/bbsde/fn-native-moviepilot/releases/latest)**
+
+| 架构 | 直连下载 | 加速下载（国内推荐） |
+| --- | --- | --- |
+| x86 | [moviepilot_3.0.0.9_x86.fpk](https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.9/moviepilot_3.0.0.9_x86.fpk) | [ghproxy.net](https://ghproxy.net/https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.9/moviepilot_3.0.0.9_x86.fpk) |
+| arm | [moviepilot_3.0.0.9_arm.fpk](https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.9/moviepilot_3.0.0.9_arm.fpk) | [ghproxy.net](https://ghproxy.net/https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.9/moviepilot_3.0.0.9_arm.fpk) |
+
+> 加速前缀为公共镜像，失效时可直连或自行更换前缀；Release 附带 `.sha256` 校验值。
+> 系统要求：fnOS ≥ 1.1.3100；依赖 nodejs_v24 运行时，安装时自动拉取。
+
+**步骤**：应用中心 → 手动安装 → 选择对应架构 fpk → 向导中设置管理员账号密码（≥8 位，含字母/数字/特殊字符至少两类）→ 完成，桌面图标点开即用。
+
+## 快速上手
+
+1. **设定 → 服务**：添加下载器（qBittorrent / Transmission）
+2. **设定 → 媒体服务器**：添加媒体服务器。飞牛影视地址填 `http://<NAS-IP>:5666`，账号密码为 fnOS 登录凭据
+3. **设定 → 站点**：导入站点认证资源（支持 CookieCloud 同步）
+4. **订阅**：添加想追的内容，或使用「豆瓣想看」等插件自动同步
+
+## 更新
+
+下载新版 fpk，应用中心手动安装**覆盖升级**——配置、账号、订阅全部保留，同版本依赖升级通常一分钟内完成。MoviePilot 网页内的自动更新已停用（在线更新会覆盖本封装内置补丁并破坏依赖锁定，fpk 是唯一安全更新通道）。
+
+## 常见问题
+
+- **升级会丢配置吗？** 不会，配置/数据库/账号均在共享区，覆盖升级原样保留。
+- **网页里改了密码，桌面图标免登录失效？** 应用中心 → MoviePilot → 设置，在「网桥免登录账号」同步新密码。
+- **不信任第三方镜像？** GitHub 加速在 设定→高级设置→网络 清空即可；Bangumi 镜像在 `config/app.env` 将 `BANGUMI_API_DOMAIN` 改回 `api.bgm.tv`（需自备网络环境）。
+- **探索页某数据源转圈？** 首访有数秒中文数据加载属正常；镜像失效按上一条更换或清空回退直连。
 
 ## 工作原理
 
-MoviePilot v2 自带完整的本地（非 Docker）安装与运行系统（`scripts/local_setup.py` + `moviepilot` CLI）。本应用是对它的**薄封装**：
+以 fnOS Native 框架封装 MoviePilot v3 的本地运行系统：
 
-- **安装**：`install_callback` 用 git clone 拉取 v2 分支源码，调用上游 `moviepilot setup` 完成虚拟环境、Python 依赖、CloakBrowser 内核、前端、资源配置
-- **运行**：`cmd/main` 委托 `moviepilot` CLI 管理进程（后端 Python/FastAPI :3001 + 前端 Node/express :3000），随后启动 `gateway-bridge.js` 监听 fnOS 网关 Unix Socket
-- **访问**：通过 fnOS 统一网关 `/app/moviepilot`（浏览器 → fnOS 网关 → Unix Socket → 网关桥剥前缀 → 前端）
-- **更新**：git 部署，支持通过 MoviePilot 网页或 `moviepilot update` 在线更新（网关桥位于应用 target 目录，上游更新不会触碰它）
+```
+浏览器 → fnOS 统一网关 /app/moviepilot → Unix Socket → gateway-bridge.js（剥前缀/免登录注入）
+      → 前端 :3000（Node/express）→ 后端 :3001（FastAPI）
+```
 
-### 网桥免登录
+- **安装**：`install_callback` 释放自包含 payload（源码+依赖+内核），离线装配 venv 并初始化账号
+- **运行**：`cmd/main` 托管前后端进程与网关桥，登录密钥持久化、模块配置热重建
+- **构建**：`scripts/assemble-payload.sh` 拉取上游 v3 tag，应用构建期补丁（上游缺陷修复 + 国内网络适配），连同锁定依赖打包为 payload；`build.sh` 完成最终 fpk（本地与 CI 同一入口）
 
-通过 fnOS 桌面应用图标打开 MoviePilot 时**自动以管理员账号登录**，无需手动输密码。局域网直连 `http://<NAS-IP>:3000` 仍需手动登录。
+## 从源码构建
 
-**实现原理**（零源码 patch，全程不修改 MoviePilot 前后端代码）：
+```bash
+# 依赖：fnpack、uv（pip install uv）、Node 24、Python 3.11
+./build.sh                    # 默认：x86_64 + 上游最新 v3.x tag
+./build.sh v3.0.0             # 指定上游 tag
+MP_ARCHS="x86_64 aarch64" ./build.sh    # 双架构
+MP_SKIP_ASSEMBLE=1 ./build.sh v3.0.0    # 复用已组装 payload，快速重打
+```
 
-1. 安装向导收集的 `wizard_superuser` / `wizard_password` 由 `moviepilot setup` 写入 `app.env` 的 `SUPERUSER` / `SUPERUSER_PASSWORD`
-2. `cmd/main` 启动网关桥时从 `app.env` 读取这两个字段，注入为 `BRIDGE_LOGIN_USER` / `BRIDGE_LOGIN_PASS` 环境变量
-3. 网关桥（`gateway-bridge.js`）收到 HTML 入口请求时，用该凭据 `POST /api/v1/login/access-token` 换取完整登录态（JWT + 用户信息，8 天有效，缓存复用）
-4. 桥把登录态以 inline `<script>` 注入 `index.html` 的 `<head>`，浏览器执行后同时写入 localStorage 的两个 pinia store：
-   - `auth` store：`{ token }`（JWT，供路由守卫 + API 请求 `Authorization: Bearer` 头）
-   - `user` store：`{ superUser, userID, userName, permissions, ... }`（供权限/菜单/身份判断）
-5. SPA 路由守卫读到 token → 跳过登录页；读 `userStore.superUser=true` → 进管理员 dashboard
+环境变量：`MP_ARCHS`（架构）、`MP_APPVER`（版本，默认 `<上游三段>.1`）、`MP_UPSTREAM`（上游 tag）、`MP_SKIP_ASSEMBLE`（复用缓存）。
 
-**为什么必须同时写两个 store**：前端路由 `if (!authStore.token) return '/login'; return userStore.superUser ? '/dashboard' : '/apps'`——只有 token 没 user 信息会被判定为匿名普通用户，进不了管理员页面。前端无"启动时按 token 自动拉 user/current"的自愈机制，必须由桥把 user 信息一并注入。
+CI：`build-fpk.yml`（可复用构建）、`release.yml`（手动 dispatch：构建 → tag `v<appver>` → Release）。
 
-**为什么不伪造 JWT**：MoviePilot 的 `SECRET_KEY` 每次启动随机生成（`secrets.token_urlsafe(32)`），不写 `app.env`，无法离线签名。**为什么不用 API 令牌**：API 令牌（`X-API-KEY`）只在后端 `verify_token` 依赖里现造一个内存中的 superuser payload，不会签发 JWT，前端 SPA 完全感知不到"已登录"——仍是匿名状态。
-
-**改绑账号**：fnOS 应用设置页（`wizard/config` 向导）可修改免登录账号密码。注意：若在 MoviePilot 网页内改了密码，需在此同步更新，否则免登录失效。
-
-**安全边界**：
-- 免登录 JWT 仅经 Unix Socket（fnOS 网关路径 `/app/moviepilot`）注入，局域网直连 :3000 不注入
-- JWT 缓存在网关桥进程内存，8 天有效，过期后刷新页面自动重新登录
-- 已手动登录的浏览器（localStorage 有 token）不会被覆盖，保留用户当前会话
-
-## 目录结构
+## 仓库结构
 
 ```
 fn-native-moviepilot/
-├── manifest              # 应用元数据
-├── config/
-│   ├── privilege         # 运行权限（run-as: package）
-│   └── resource          # 数据共享声明
-├── cmd/                  # 生命周期脚本
-│   ├── main              # start / stop / status
-│   ├── install_callback  # 安装：git clone + setup
-│   ├── upgrade_callback  # 升级：git pull + setup
-│   ├── uninstall_callback
-│   └── *_init / config_* 
-├── app/
-│   ├── ui/config         # 桌面入口（统一网关模式）
-│   └── bin/              # 随包脚本
-│       ├── gateway-bridge.js       # 网关桥：Unix Socket → 剥前缀 → 免登录注入 → 前端 :3000
-│       └── gh-proxy                # GitHub 加速工具（git insteadOf + 文件下载）
-├── wizard/
-│   ├── install          # 安装向导（设置管理员账号密码，同时用于免登录）
-│   └── config           # 应用设置向导（改绑免登录账号密码）
-├── ICON.PNG / ICON_256.PNG
-└── README.md
+├── src/                    # fnOS 应用包内容（打进 fpk）
+│   ├── cmd/                #   生命周期脚本（install/upgrade/main/…）
+│   ├── app/bin/            #   网关桥（gateway-bridge.js）等随包脚本
+│   ├── app/ui/             #   桌面入口配置 + 图标
+│   ├── config/ · wizard/   #   权限/资源声明 · 安装与配置向导
+│   ├── manifest            #   应用元数据（版本、依赖、变更日志）
+│   └── ICON*.PNG           #   应用图标
+├── scripts/assemble-payload.sh   # payload 组装（上游拉取+补丁+依赖锁定+内核）
+├── build.sh                # fpk 构建入口（本地/CI 单一路径）
+├── docs/                   # 构建方案 · 发布帖等
+├── dist/                   # 构建产物（.fpk + 校验，不入库）
+└── build/ · cache/         # 组装工作区与上游缓存（不入库）
 ```
 
-## 国内加速
+## 版本与日志
 
-安装全程走国内镜像源（不修改 MoviePilot 源码）：
+版本号 `<上游三段>.<打包段>`（如 `3.0.0.9`）。完整更新记录见 **[CHANGELOG.md](CHANGELOG.md)**。
 
-| 下载环节 | 镜像 |
-| --- | --- |
-| Python 依赖 | 清华 PyPI |
-| npm 依赖 | npmmirror |
-| GitHub（源码/前端/资源） | 随包 [`gh-proxy`](https://gitee.com/rexond/gh-proxy)：多镜像并行测速选最快 + 失败回退直连 |
-| CloakBrowser 内核 | GitHub Release（走 gh-proxy 加速），失败回退 cloakbrowser.dev 官方源 |
+## 致谢
 
-> `gh-proxy` 同时承担源码 clone/pull 加速（`gh-proxy clone`：替换 URL 走镜像竞速，clone 完自动还原官方 origin + 配 `insteadOf` 让后续 fetch/pull 透明走代理）与文件下载（`gh-proxy download`）。
+- [jxxghp/MoviePilot](https://github.com/jxxghp/MoviePilot) 及上游贡献者
+- [飞牛 fnOS](https://www.fnation.cn) Native 应用框架
+- [Bangumi 番组计划](https://bgm.tv) · [Mirrox](https://bangumi.lol) 社区镜像
 
-## 打包与安装
-
-```bash
-# 打包为 .fpk（内核不再内置，安装时从 GitHub Release 下载）
-fnpack build
-
-# 安装到 fnOS 设备
-appcenter-cli install-fpk moviepilot.fpk
-```
-
-## 相关
-
-- MoviePilot 上游：<https://github.com/jxxghp/MoviePilot>
-- 飞牛 fnOS 应用开发：<https://help.fnnas.com>
+> 仅供学习交流；请支持正版，尊重版权。
