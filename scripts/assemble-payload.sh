@@ -455,7 +455,7 @@ patch_body = """\
     #   上游组合根/测试引导均先 configure 再用 Oper，此处漏配）
     from app.db.adapters.transaction import TransactionalWriteRunner
     from app.db.session import SessionFactory, async_session_scope
-    from app.db.uow import configure_transaction_runners
+    from app.db.uow import configure_transaction_runners, run_sync_transaction
     _fnos_runner = TransactionalWriteRunner(
         sync_session=SessionFactory,
         async_session=async_session_scope,
@@ -465,10 +465,25 @@ patch_body = """\
         async_=_fnos_runner.async_,
     )
 """
+# 第二处：update 调用把 user_oper._db（None）传给模型 update，游离对象
+# 触发 db.add(self) → 'NoneType' object has no attribute 'add'。
+# 改经 runner 包一层等价事务（独占会话提交，与上游架构语义一致）。
+update_anchor = "        user.update(user_oper._db, update_payload)\n"
+update_patch = (
+    "        # fn-native-moviepilot 补丁：_db 为 None（Oper 均经组合根 runner\n"
+    "        # 独占会话提交），模型 update 需显式会话，改经 runner 事务\n"
+    "        run_sync_transaction(\n"
+    "            lambda _fnos_s: user.update(_fnos_s, update_payload)\n"
+    "        )\n"
+)
 if anchor not in src:
     raise SystemExit("锚点未找到，上游 local_setup 结构已变化，需人工复核")
-io.open(path, "w", encoding="utf-8", newline="").write(src.replace(anchor, patch_body + anchor, 1))
-print("sync-superuser 事务执行器补丁已应用")
+if src.count(update_anchor) != 1:
+    raise SystemExit("update 锚点异常（出现 %d 次），需人工复核" % src.count(update_anchor))
+src = src.replace(anchor, patch_body + anchor, 1)
+src = src.replace(update_anchor, update_patch, 1)
+io.open(path, "w", encoding="utf-8", newline="").write(src)
+print("sync-superuser 事务执行器补丁已应用（runner 注册 + update 事务包裹）")
 PYEOF
 )
         log "已应用 sync-superuser 事务执行器补丁（init 崩溃修复）"

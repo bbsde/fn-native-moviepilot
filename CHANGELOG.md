@@ -6,6 +6,12 @@
 
 ---
 
+## [3.0.0.17] - 2026-08-26
+
+### 修复
+
+- **修复 3.0.0.16 仍安装失败（同函数第二处上游缺陷）**：`_ensure_superuser_account_inner` 里 `user.update(user_oper._db, update_payload)` 把 `None` 传给模型 `Base.update`——runner 查询（`get_by_name`）在独占会话中完成后关闭，返回的 user 是游离态，`Base.update` 检测到 detached 即调 `db.add(self)` → `'NoneType' object has no attribute 'add'` → init 崩。补丁 #6 追加第二处替换：update 调用改经 `run_sync_transaction` 事务包裹（独占会话 + 提交，与上游架构语义一致）。`UserOper.add`/`get_by_name` 本就走 runner 路径，无需处理
+
 ## [3.0.0.16] - 2026-08-26
 
 ### 修复
