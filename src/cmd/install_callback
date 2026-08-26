@@ -11,6 +11,8 @@
 #
 # payload.tar 内容（释放到 TRIM_PKGVAR）：
 #   MoviePilot/               上游源码快照（含 public/ 前端成品、app/application/site/ 资源）
+#   python/                   内置 CPython 3.14 运行时（上游 requires-python >=3.14，
+#                             飞牛内置 Python 3.11 不可用；venv 由它创建，须常驻）
 #   wheels/                   pip wheels（--no-index 离线安装）
 #   payload.lock              精确依赖清单（name==version）
 #   payload.meta              元信息（KERNEL_VERSION / LOCK_SHA256 / UPSTREAM_TAG / ARCH）
@@ -34,6 +36,7 @@ WHEELS_DIR="${DATA_DIR}/wheels"
 PAYLOAD_LOCK="${DATA_DIR}/payload.lock"
 PAYLOAD_META="${DATA_DIR}/payload.meta"
 CLOAK_CACHE="${DATA_DIR}/cloakbrowser-cache"
+PY_BIN="${DATA_DIR}/python/bin/python3" # 内置 CPython 3.14（payload 自带）
 
 # Node 运行时：fnOS 应用中心依赖 nodejs_v24（manifest install_dep_apps 声明，
 # 安装时自动拉取），路径固定。上游 _frontend_node_binary 优先找 .runtime/node/bin/node，
@@ -93,8 +96,8 @@ read_meta() {
 }
 
 # --------------------------------------------------------------------------
-# 前置检查（venv 自检仅记录结论：真实验证与三级兜底在 create_venv，
-# appcenter 安装上下文与交互 shell 环境差异大，预检结果不能代表创建必败）
+# 前置检查（Python 校验在 release_payload 后：内置运行时随 payload 释放，
+# 此处只验证 payload 与 Node；venv 三级兜底在 create_venv）
 # --------------------------------------------------------------------------
 preflight() {
     log "=== 前置检查 ==="
@@ -102,32 +105,11 @@ preflight() {
     [ -n "${DATA_DIR:-}" ] || fail "TRIM_PKGVAR 未设置"
     [ -f "${PAYLOAD_TAR}" ] || fail "payload.tar 缺失：${PAYLOAD_TAR}（fpk 损坏或为占位包）"
 
-    command -v python3 >/dev/null 2>&1 || fail "未找到 python3（需飞牛内置 Python 3.11+）"
-    PY_VER="$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo 0)"
-    PY_MAJOR="$(echo "${PY_VER}" | cut -d. -f1)"
-    PY_MINOR="$(echo "${PY_VER}" | cut -d. -f2)"
-    if [ "${PY_MAJOR}" -lt 3 ] || { [ "${PY_MAJOR}" -eq 3 ] && [ "${PY_MINOR}" -lt 11 ]; }; then
-        fail "需要 Python 3.11+，当前为 ${PY_VER}（内置 Python 版本由飞牛系统控制）"
-    fi
-    log "Python: ${PY_VER} ($(command -v python3))"
-
     if [ -x "${NODE_DEP_BIN}/node" ]; then
         log "Node: $("${NODE_DEP_BIN}/node" --version 2>/dev/null)（nodejs_v24 依赖）"
     else
         fail "未找到 nodejs_v24 运行时：${NODE_DEP_BIN}/node（manifest install_dep_apps 未生效？）"
     fi
-
-    # venv 能力自检（真建一次测试 venv；失败不阻断，create_venv 有三级兜底）
-    local test_dir
-    test_dir="$(mktemp -d)"
-    if python3 -m venv "${test_dir}/t" >> "${INSTALL_LOG}" 2>&1 \
-       && [ -x "${test_dir}/t/bin/pip" ] \
-       && "${test_dir}/t/bin/pip" --version >/dev/null 2>&1; then
-        log "venv 自检通过（ensurepip 可用）"
-    else
-        log "[WARN] venv 自检未通过（ensurepip 缺失或环境受限），创建时将走 --without-pip / 手工构建兜底"
-    fi
-    rm -rf "${test_dir}"
 
     log "前置检查通过"
 }
@@ -140,7 +122,7 @@ preflight() {
 release_payload() {
     log "=== 释放 payload（$(du -h "${PAYLOAD_TAR}" 2>/dev/null | cut -f1)）==="
     mkdir -p "${DATA_DIR}"
-    rm -rf "${MP_ROOT}" "${WHEELS_DIR}" "${DATA_DIR}/kernel"
+    rm -rf "${MP_ROOT}" "${WHEELS_DIR}" "${DATA_DIR}/kernel" "${DATA_DIR}/python"
     rm -f "${PAYLOAD_LOCK}" "${PAYLOAD_META}"
     if ! tar -xf "${PAYLOAD_TAR}" -C "${DATA_DIR}" >> "${INSTALL_LOG}" 2>&1; then
         fail "payload 释放失败（payload.tar 损坏？）"
@@ -148,6 +130,15 @@ release_payload() {
     [ -x "${MP_ROOT}/moviepilot" ] || fail "释放后未找到 ${MP_ROOT}/moviepilot（payload 结构异常）"
     [ -f "${PAYLOAD_LOCK}" ] || fail "释放后未找到 payload.lock"
     [ -f "${PAYLOAD_META}" ] || fail "释放后未找到 payload.meta"
+
+    # 内置 Python：payload 在 MSYS 构建机上打包时 ELF 无执行位，显式补齐
+    # 后自证可运行（上游 requires-python >= 3.14）
+    chmod +x "${DATA_DIR}/python/bin/"* 2>/dev/null || true
+    if ! "${PY_BIN}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 14) else 1)' \
+        >> "${INSTALL_LOG}" 2>&1; then
+        fail "内置 Python 不可用或版本 < 3.14：${PY_BIN}"
+    fi
+    log "内置 Python 就绪：$("${PY_BIN}" --version 2>&1)"
 
     KERNEL_VERSION="$(read_meta KERNEL_VERSION)"
     LOCK_SHA256="$(read_meta LOCK_SHA256)"
@@ -177,17 +168,17 @@ setup_node_symlinks() {
 }
 
 # --------------------------------------------------------------------------
-# 设备端 venv：离线 pip 安装（方案 A）
+# 设备端 venv：内置 Python 3.14 创建 + 离线 pip 安装（方案 A）
 # 三级兜底（appcenter 安装上下文实测存在 python -m venv 静默失败的环境）：
-#   ① python3 -m venv（标准）② --without-pip ③ 手工构建（目录 + pyvenv.cfg
-#   + 符号链接，完全不依赖 venv 模块）——pip 一律由随包 wheel 自举补齐。
+#   ① PY_BIN -m venv（标准）② --without-pip ③ 手工构建（目录 + pyvenv.cfg
+#   + 符号链接，完全不依赖 venv 模块）--pip 一律由随包 wheel 自举补齐。
 # --------------------------------------------------------------------------
 # 手工构建 venv：等价于 venv 模块的核心产物（pyvenv.cfg + bin/python 链接 +
 # site-packages），venv 模块不可用/受限时的最终兜底。
 manual_venv() {
     local venv_dir="$1"
     local py_bin py_home py_full pyver
-    py_bin="$(command -v python3)"
+    py_bin="${PY_BIN}"
     py_home="$(dirname "${py_bin}")"
     py_full="$("${py_bin}" -c 'import platform; print(platform.python_version())' 2>/dev/null)" || return 1
     pyver="$("${py_bin}" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null)" || return 1
@@ -204,17 +195,17 @@ manual_venv() {
 }
 
 create_venv() {
-    log "=== 创建虚拟环境（离线装配）==="
+    log "=== 创建虚拟环境（离线装配，$("${PY_BIN}" --version 2>&1)）==="
     local venv_dir="${MP_ROOT}/venv"
 
     rm -rf "${venv_dir}"
-    if python3 -m venv "${venv_dir}" >> "${INSTALL_LOG}" 2>&1; then
+    if "${PY_BIN}" -m venv "${venv_dir}" >> "${INSTALL_LOG}" 2>&1; then
         log "venv 创建成功（标准模式）"
-    elif python3 -m venv --without-pip "${venv_dir}" >> "${INSTALL_LOG}" 2>&1; then
+    elif "${PY_BIN}" -m venv --without-pip "${venv_dir}" >> "${INSTALL_LOG}" 2>&1; then
         log "venv 创建成功（--without-pip 模式，pip 稍后自举）"
     else
         # 记录上下文快照供事后排查（appcenter 环境与交互 shell 差异大）
-        log "[WARN] python3 -m venv 两种模式均失败，转手工构建 venv"
+        log "[WARN] PY_BIN -m venv 两种模式均失败，转手工构建 venv"
         log "[WARN] 诊断：user=$(id -un 2>/dev/null) HOME=${HOME:-未设置} TMPDIR=${TMPDIR:-未设置} PATH=${PATH}"
         manual_venv "${venv_dir}" || fail "手工 venv 构建失败（详见 ${INSTALL_LOG}）"
         log "venv 手工构建成功"
@@ -374,7 +365,7 @@ ensure_secret_keys() {
             log "${key} 已存在，保持不变"
             continue
         fi
-        val="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+        val="$("${PY_BIN}" -c 'import secrets; print(secrets.token_urlsafe(48))')"
         [ -n "${val}" ] || fail "生成 ${key} 失败"
         [ -s "${env_file}" ] && [ "$(tail -c1 "${env_file}" 2>/dev/null)" != $'\n' ] && printf '\n' >> "${env_file}"
         printf '%s=%s\n' "${key}" "${val}" >> "${env_file}"
@@ -390,7 +381,8 @@ ensure_secret_keys() {
 run_init() {
     log "=== 初始化 MoviePilot（${UPSTREAM_TAG}）==="
     cd "${MP_ROOT}" || fail "无法进入 ${MP_ROOT}"
-    export PATH="${MP_ROOT}/.runtime/node/bin:${NODE_DEP_BIN}:${PATH}"
+    # 内置 Python 进 PATH：上游 wrapper 找不到 venv 时的 bootstrap 兜底
+    export PATH="${DATA_DIR}/python/bin:${MP_ROOT}/.runtime/node/bin:${NODE_DEP_BIN}:${PATH}"
     export HOME="${TRIM_PKGHOME:-${DATA_DIR}}"
     export CLOAKBROWSER_CACHE_DIR="${CLOAK_CACHE}"
 

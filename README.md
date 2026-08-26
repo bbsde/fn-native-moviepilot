@@ -25,7 +25,7 @@
 
 **📦 自包含离线安装**
 
-安装包内置全部依赖：上游源码、前端、174 个 Python wheel（按目标平台锁定）、CloakBrowser 内核、站点资源。安装**无需外网、无需 SSH、无需 Python/Node 环境**，通常 1~5 分钟完成。
+安装包内置全部依赖：上游源码、前端、内置 CPython 3.14 运行时、全部 Python wheel（按目标平台锁定自上游 uv.lock）、CloakBrowser 内核、站点资源。安装**无需外网、无需 SSH、无需 Python/Node 环境**，通常 1~5 分钟完成。
 
 **🇨🇳 国内网络免代理可用**
 
@@ -100,7 +100,7 @@
 ## 从源码构建
 
 ```bash
-# 依赖：fnpack、uv（pip install uv）、Node 24、Python 3.11
+# 依赖：fnpack、uv 0.12.5（pip install "uv==0.12.5"，须与上游 required-version 一致）、Node 24、Python 3.14
 ./build.sh                    # 默认：x86_64 + 上游最新 v3.x tag
 ./build.sh v3.0.0             # 指定上游 tag
 MP_ARCHS="x86_64 aarch64" ./build.sh    # 双架构

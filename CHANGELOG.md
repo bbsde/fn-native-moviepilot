@@ -6,6 +6,15 @@
 
 ---
 
+## [3.0.0.15] - 2026-08-26
+
+### 变更
+
+- **跟进上游 v3.0.0 正式版**：上游于 2026-08-25 将 `v3.0.0` tag 移至正式发布代码（较 3.0.0.14 构建时的新 429 个提交）：依赖管理从 `requirements.in` 迁至 `pyproject.toml` + `uv.lock`，`requires-python >= 3.14`
+- **fpk 内置 CPython 3.14 运行时**（python-build-standalone 3.14.7+20260825，双架构）：上游要求 Python ≥ 3.14，飞牛内置 Python 3.11 不再可用；设备端 venv 改由随包运行时创建（`install_callback`/`upgrade_callback` 同步改造，不再依赖系统 Python）
+- **依赖锁定自上游 uv.lock**：构建管线改为 `uv export --frozen` 导出精确版本 + 按目标平台求值 marker（构建机 uv 版本须与上游 required-version 一致：0.12.5）；wheels 全面升级 cp314
+- 站点资源 `.so` 跟随升级 cpython-314；构建期补丁 #1（security.access 错误导入）上游已修复自动停用，#2~#5 锚点核对全部有效
+
 ## [3.0.0.14] - 2026-08-20
 
 ### 新增

@@ -47,7 +47,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
+          python-version: '3.14'
 
       - name: Install fnpack
         run: |
@@ -55,8 +55,10 @@ jobs:
             "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-${{ matrix.fnpack_platform }}"
           chmod +x /usr/local/bin/fnpack
 
+      # uv 版本钉死：上游 pyproject required-version == 0.12.5，版本不符 uv
+      # 会拒绝执行 export（assemble-payload.sh 依赖它从上游 uv.lock 导出依赖）
       - name: Install uv
-        run: pip install uv
+        run: pip install "uv==0.12.5"
 
       - name: Build fpk (${{ matrix.arch }})
         env:

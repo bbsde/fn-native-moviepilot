@@ -33,6 +33,7 @@ PAYLOAD_META="${DATA_DIR}/payload.meta"
 CLOAK_CACHE="${DATA_DIR}/cloakbrowser-cache"
 VENV_STASH="${DATA_DIR}/venv.stash"
 NODE_DEP_BIN="/var/apps/nodejs_v24/target/bin"
+PY_BIN="${DATA_DIR}/python/bin/python3" # 内置 CPython 3.14（payload 自带）
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') | [UPGRADE] $*" | tee -a "${INSTALL_LOG}" 2>/dev/null || \
@@ -102,11 +103,16 @@ UPSTREAM_TAG=""
 
 if [ -f "${PAYLOAD_TAR}" ]; then
     log "释放新 payload ..."
-    rm -rf "${MP_ROOT}" "${WHEELS_DIR}" "${DATA_DIR}/kernel"
+    rm -rf "${MP_ROOT}" "${WHEELS_DIR}" "${DATA_DIR}/kernel" "${DATA_DIR}/python"
     rm -f "${PAYLOAD_LOCK}" "${PAYLOAD_META}"
     tar -xf "${PAYLOAD_TAR}" -C "${DATA_DIR}" >> "${INSTALL_LOG}" 2>&1 \
         || fail "payload 释放失败"
     [ -x "${MP_ROOT}/moviepilot" ] || fail "释放后未找到 ${MP_ROOT}/moviepilot"
+    # 内置 Python：MSYS 构建机打包时 ELF 无执行位，显式补齐后自证
+    chmod +x "${DATA_DIR}/python/bin/"* 2>/dev/null || true
+    "${PY_BIN}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 14) else 1)' \
+        >> "${INSTALL_LOG}" 2>&1 || fail "内置 Python 不可用或版本 < 3.14：${PY_BIN}"
+    log "内置 Python 就绪：$("${PY_BIN}" --version 2>&1)"
     KERNEL_VERSION="$(read_meta KERNEL_VERSION)"
     LOCK_SHA256="$(read_meta LOCK_SHA256)"
     UPSTREAM_TAG="$(read_meta UPSTREAM_TAG)"
@@ -132,15 +138,15 @@ fi
 
 if [ "${VENV_REUSED}" != "1" ] && [ -f "${PAYLOAD_LOCK}" ] && [ -d "${WHEELS_DIR}" ]; then
     rm -rf "${MP_ROOT}/venv"
-    if python3 -m venv "${MP_ROOT}/venv" >> "${INSTALL_LOG}" 2>&1; then
+    if "${PY_BIN}" -m venv "${MP_ROOT}/venv" >> "${INSTALL_LOG}" 2>&1; then
         log "venv 重建成功（标准模式）"
-    elif python3 -m venv --without-pip "${MP_ROOT}/venv" >> "${INSTALL_LOG}" 2>&1; then
+    elif "${PY_BIN}" -m venv --without-pip "${MP_ROOT}/venv" >> "${INSTALL_LOG}" 2>&1; then
         log "venv 重建成功（--without-pip 模式）"
     else
         # 与 install_callback 相同的手工构建兜底（appcenter 上下文 -m venv 可能静默失败）
-        log "[WARN] python3 -m venv 两种模式均失败，转手工构建 venv"
+        log "[WARN] PY_BIN -m venv 两种模式均失败，转手工构建 venv"
         log "[WARN] 诊断：user=$(id -un 2>/dev/null) HOME=${HOME:-未设置} TMPDIR=${TMPDIR:-未设置} PATH=${PATH}"
-        py_bin="$(command -v python3)"
+        py_bin="${PY_BIN}"
         py_home="$(dirname "${py_bin}")"
         py_full="$("${py_bin}" -c 'import platform; print(platform.python_version())' 2>/dev/null)"
         pyver="$("${py_bin}" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null)"
@@ -185,7 +191,7 @@ EOF
     touch "${local_keys_env}"
     for _key in SECRET_KEY RESOURCE_SECRET_KEY; do
         if ! grep -qE "^[[:space:]]*${_key}=" "${local_keys_env}"; then
-            _val="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+            _val="$("${PY_BIN}" -c 'import secrets; print(secrets.token_urlsafe(48))')"
             [ -n "${_val}" ] && printf '%s=%s\n' "${_key}" "${_val}" >> "${local_keys_env}" \
                 && log "${_key} 已生成并写入 app.env"
         fi

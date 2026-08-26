@@ -9,6 +9,7 @@
 # 产物：build/payload-<arch>.tar（未压缩；内容皆已压缩格式，再压收益极小）
 # 布局（释放到 TRIM_PKGVAR 后）：
 #   MoviePilot/               上游源码快照 + public/ 前端成品 + app/application/site/ 资源
+#   python/                   内置 CPython 3.14 运行时（python-build-standalone）
 #   wheels/                   pip wheels（设备端 --no-index 离线安装）
 #   payload.lock              精确依赖清单（name==version，由 wheels 文件名生成）
 #   payload.meta              元信息（KERNEL_VERSION/LOCK_SHA256/...，安装/升级脚本消费）
@@ -20,6 +21,7 @@
 #   wheels/<tag>-<arch>/      wheels + payload.lock（按 tag+arch 锁定一次）
 #   kernel/<plat>/            官方内核包 + 重组后的 chromium-<v>.tar
 #   resources/                MoviePilot-Resources main.zip + 过滤产物
+#   python/<triple>/          python-build-standalone 官方包
 #
 # 关键设计：
 #   - 前端在构建期组装成品（dist + service.js + express node_modules），跳过上游
@@ -28,8 +30,12 @@
 #     我们自动跟随；提取失败即构建失败，不会静默漂移）
 #   - CloakBrowser 内核版本从随包 cloakbrowser wheel 的 PLATFORM_CHROMIUM_VERSIONS
 #     解析（内核与 wrapper 版本严格自洽，不硬编码）
-#   - requirements.in 过滤 Windows-only marker 行（本地 Windows 构建时 pip 的
-#     platform_system 仍取宿主值，会把 pywin32 拉进 lock，设备端安装必炸）
+#   - 依赖锁定自上游 uv.lock：uv export --frozen 导出精确版本（保留全平台
+#     marker），再 uv pip compile 按目标平台求值 marker 落定闭包。构建机 uv
+#     版本须与上游 pyproject 的 required-version 一致（0.12.5），否则 uv 拒绝执行
+#   - 内置 Python 3.14：上游 requires-python >= 3.14，飞牛内置 Python 3.11
+#     不可用 -> payload 自带运行时，设备端用它建 venv（MSYS 构建机 tar 释放的
+#     ELF 无执行位，install/upgrade 释放后显式 chmod 兜底）
 
 set -euo pipefail
 
@@ -44,7 +50,10 @@ esac
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CACHE="${MP_CACHE:-${REPO_DIR}/cache}"
 BUILD="${MP_BUILD:-${REPO_DIR}/build}"
-PYV="${MP_PYTHON_VERSION:-311}"
+PYV="${MP_PYTHON_VERSION:-314}"
+# 内置 CPython 运行时（python-build-standalone，上游 requires-python >= 3.14）
+PBS_BUILD="${MP_PBS_BUILD:-20260825}"
+PBS_PYTHON="${MP_PBS_PYTHON:-3.14.7}"
 
 log() { echo "[payload] $*"; }
 die() { echo "[payload][ERROR] $*" >&2; exit 1; }
@@ -67,20 +76,27 @@ require_tools() {
     "${PY}" -m pip --version >/dev/null 2>&1 || die "pip 不可用"
 }
 
+# 稳健下载：先写 .tmp 成功才转正（curl 中断残留的半截文件不会被缓存
+# 判定误认为完整；dest 已存在即跳过，本地弱网重跑可续过每个大文件）
+fetch_cached() {
+    local url="$1" dest="$2"
+    [ -s "${dest}" ] && { log "已缓存：${dest}"; return 0; }
+    mkdir -p "$(dirname "${dest}")"
+    log "下载 $(basename "${dest}") ..."
+    if curl -fSL --retry 3 --connect-timeout 20 -o "${dest}.tmp" "${url}" \
+        && mv -f "${dest}.tmp" "${dest}"; then
+        return 0
+    fi
+    rm -f "${dest}.tmp"
+    die "下载失败：${url}"
+}
+
 # --------------------------------------------------------------------------
 # 1. 上游源码包（codeload tag 快照，非 git，无 .git）
 # --------------------------------------------------------------------------
 fetch_source() {
-    mkdir -p "${CACHE}/upstream"
     local archive="${CACHE}/upstream/${TAG}.tar.gz"
-    if [ ! -f "${archive}" ]; then
-        log "下载上游源码 ${TAG} ..."
-        curl -fSL --retry 3 --connect-timeout 20 -o "${archive}" \
-            "https://codeload.github.com/jxxghp/MoviePilot/tar.gz/refs/tags/${TAG}" \
-            || die "上游源码下载失败：${TAG}"
-    else
-        log "上游源码已缓存：${archive}"
-    fi
+    fetch_cached "https://codeload.github.com/jxxghp/MoviePilot/tar.gz/refs/tags/${TAG}" "${archive}"
     SRC_ARCHIVE="${archive}"
 }
 
@@ -96,7 +112,8 @@ stage_source() {
     rm -rf "${BUILD}/payload" 2>/dev/null || true
     mkdir -p "${BUILD}/payload/MoviePilot"
     tar -xzf "${SRC_ARCHIVE}" -C "${BUILD}/payload/MoviePilot" --strip-components=1
-    [ -f "${BUILD}/payload/MoviePilot/requirements.in" ] || die "源码包缺少 requirements.in（tag 异常？）"
+    [ -f "${BUILD}/payload/MoviePilot/pyproject.toml" ] || die "源码包缺少 pyproject.toml（tag 异常？）"
+    [ -f "${BUILD}/payload/MoviePilot/uv.lock" ] || die "源码包缺少 uv.lock（tag 异常？）"
     [ -f "${BUILD}/payload/MoviePilot/scripts/local_setup.py" ] || die "源码包缺少 scripts/local_setup.py"
 
     # 补丁 1：上游 v3.0.0 首日 bug——local_setup.py 的 _ensure_superuser_account_inner
@@ -436,12 +453,11 @@ prepare_frontend() {
        && [ -d "${public}/node_modules/express" ]; then
         log "前端已缓存：${public}"
     else
-        log "组装前端 ${FRONTEND_VERSION} ..."
-        rm -rf "${fe_dir}"
+        rm -rf "${fe_dir}/extract" "${public}"
         mkdir -p "${fe_dir}"
-        curl -fSL --retry 3 --connect-timeout 20 -o "${fe_dir}/dist.zip" \
+        fetch_cached \
             "https://github.com/jxxghp/MoviePilot-Frontend/releases/download/${FRONTEND_VERSION}/dist.zip" \
-            || die "前端 dist.zip 下载失败：${FRONTEND_VERSION}"
+            "${fe_dir}/dist.zip"
         # 注意：python 用「cd + 相对路径」取文件——原生 Windows Python 不识别
         # MSYS 的 /d/... 绝对路径（Linux CI 下同样兼容）
         (cd "${fe_dir}" && "${PY}" -c 'import zipfile; zipfile.ZipFile("dist.zip").extractall("extract")')
@@ -489,18 +505,15 @@ PYEOF
 
 # --------------------------------------------------------------------------
 # 4. 站点资源（MoviePilot-Resources main 分支 resources.v3）
-# 上游 _filter_resources_files 规则：user.sites.v3.bin + sites.cpython-311-<arch>-linux-gnu.so
+# 上游 _filter_resources_files 规则：user.sites.v3.bin + sites.cpython-<py>-<arch>-linux-gnu.so
+# （cpython 段须与 venv 实际 Python 版本一致 = 内置运行时 3.14）
 # --------------------------------------------------------------------------
 stage_resources() {
     local res_cache="${CACHE}/resources"
     local main_zip="${res_cache}/main.zip"
-    if [ ! -f "${main_zip}" ]; then
-        log "下载 MoviePilot-Resources main.zip ..."
-        mkdir -p "${res_cache}"
-        curl -fSL --retry 3 --connect-timeout 20 -o "${main_zip}" \
-            "https://github.com/jxxghp/MoviePilot-Resources/archive/refs/heads/main.zip" \
-            || die "MoviePilot-Resources 下载失败"
-    fi
+    fetch_cached \
+        "https://github.com/jxxghp/MoviePilot-Resources/archive/refs/heads/main.zip" \
+        "${main_zip}"
     local extract="${res_cache}/extracted"
     if [ ! -d "${extract}/MoviePilot-Resources-main/resources.v3" ]; then
         rm -rf "${extract}"
@@ -515,14 +528,47 @@ stage_resources() {
     mkdir -p "${site_dir}"
     cp -f "${v3dir}/user.sites.v3.bin" "${site_dir}/" || die "缺少 user.sites.v3.bin"
     local sites_so
-    sites_so="$(ls "${v3dir}" | grep "cpython-311" | grep "${ARCH}" | grep "linux-gnu" | head -1 || true)"
-    [ -n "${sites_so}" ] || die "未找到匹配 ${ARCH}+cpython-311 的 sites 资源（目录内容：$(ls "${v3dir}" | tr '\n' ' '))"
+    sites_so="$(ls "${v3dir}" | grep "cpython-${PYV}" | grep "${ARCH}" | grep "linux-gnu" | head -1 || true)"
+    [ -n "${sites_so}" ] || die "未找到匹配 ${ARCH}+cpython-${PYV} 的 sites 资源（目录内容：$(ls "${v3dir}" | tr '\n' ' '))"
     cp -f "${v3dir}/${sites_so}" "${site_dir}/"
     log "站点资源就位：user.sites.v3.bin + ${sites_so}"
 }
 
 # --------------------------------------------------------------------------
-# 5. pip wheels（跨平台下载：--python-version/--platform 定向 cp311+manylinux）
+# 4.5 内置 CPython 运行时（python-build-standalone install_only）
+# 上游 requires-python >= 3.14 而飞牛内置 Python 为 3.11 -> payload 自带 3.14，
+# 设备端 install/upgrade 用它创建 venv（venv 内解释器链接回本目录，须常驻）。
+# --------------------------------------------------------------------------
+stage_python() {
+    local triple
+    case "${ARCH}" in
+        x86_64)  triple="x86_64-unknown-linux-gnu" ;;
+        aarch64) triple="aarch64-unknown-linux-gnu" ;;
+    esac
+    local py_cache="${CACHE}/python/${triple}"
+    local asset="cpython-${PBS_PYTHON}+${PBS_BUILD}-${triple}-install_only.tar.gz"
+    mkdir -p "${py_cache}"
+    fetch_cached \
+        "https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_BUILD}/${asset}" \
+        "${py_cache}/${asset}"
+    rm -rf "${BUILD}/payload/python"
+    mkdir -p "${BUILD}/payload/python"
+    # 官方包顶层目录为 python/，--strip-components=1 释放到 payload/python/。
+    # share/terminfo 含大量相对符号链接，NAS 端无用，MSYS 释放还会因符号链接
+    # 顺序炸 tar --整个剔除（Chromium 内核同理不含该目录）。
+    # MSYS 构建机上须开 nativestrict 符号链接（否则 bin/python3 等相对链接
+    # 降级为复制失败，tar 报 Cannot create symlink）；Linux CI 无此变量影响。
+    # MSYS 构建机上 ELF 不带执行位，设备端释放后 chmod 兜底，见 install_callback
+    ( export MSYS="${MSYS:+${MSYS} }winsymlinks:nativestrict"
+      tar -xzf "${py_cache}/${asset}" -C "${BUILD}/payload/python" --strip-components=1 \
+          --exclude='python/share/terminfo' ) \
+        || die "Python 运行时解压失败"
+    [ -e "${BUILD}/payload/python/bin/python3" ] || die "Python 运行时解压异常（缺 bin/python3）"
+    log "内置 Python 就绪：${PBS_PYTHON}+${PBS_BUILD}（${triple}）"
+}
+
+# --------------------------------------------------------------------------
+# 5. pip wheels（跨平台下载：--python-version/--platform 定向 cp314+manylinux）
 # lock 由 wheels 文件名生成（name==version），缓存在 cache/wheels/<tag>-<arch>/
 # 额外携带 pip + wheel 两个 wheel（设备端 ensurepip 缺失时自举用）。
 # --------------------------------------------------------------------------
@@ -532,38 +578,41 @@ fetch_wheels() {
     if [ -f "${wheel_cache}/payload.lock" ]; then
         log "wheels 已缓存：${wheel_cache}"
     else
-        log "解析依赖（uv，按目标平台 ${ARCH} cp${PYV} 求值 marker）..."
+        log "解析依赖（uv export 上游 uv.lock -> 目标平台 ${ARCH} cp${PYV}）..."
         # pip 的跨平台下载只影响 wheel 标签匹配，环境 marker（sys_platform/
-        # platform_system）仍按宿主求值——Windows 宿主会把 docker 的
-        # pywin32 传递依赖拉进来且无 Linux wheel 可下。uv 的 --python-platform
-        # 按目标平台正确求值 marker，产出的 lock 设备端可直接 pip -r 安装。
+        # platform_system）仍按宿主求值--Windows 宿主会把 docker 的
+        # pywin32 传递依赖拉进来且无 Linux wheel 可下。两步走：
+        #   ① uv export --frozen 从上游 uv.lock 导出精确版本（== 钉死，
+        #      不重解析），导出行保留全平台 marker；
+        #   ② uv pip compile --python-platform 按目标平台求值 marker 落定
+        #      最终闭包（pip/wheel 为设备端自举与运行时兜底额外附带）。
+        # uv 版本须与上游 pyproject required-version 一致（0.12.5）。
+        # uv 为原生二进制，路径须相对形式（同 python 的 MSYS 路径问题）
         local triple
         case "${ARCH}" in
             x86_64)  triple="x86_64-unknown-linux-gnu" ;;
             aarch64) triple="aarch64-unknown-linux-gnu" ;;
         esac
-        # uv 为原生二进制，路径须相对形式（同 python 的 MSYS 路径问题）
-        if ! (cd "${BUILD}" && uv pip compile "payload/MoviePilot/requirements.in" \
+        if ! (cd "${BUILD}/payload/MoviePilot" && uv export --frozen --no-dev \
+                --no-emit-project --no-hashes --quiet \
+                --output-file ../../payload.lock.export) ; then
+            die "uv export 上游依赖失败（uv 版本须为上游 required-version 0.12.5）"
+        fi
+        printf 'pip\nwheel\n' >> "${BUILD}/payload.lock.export"
+        if ! (cd "${BUILD}" && uv pip compile payload.lock.export \
                 --default-index "${PYPI_INDEX}" \
                 --python-platform "${triple}" \
-                --python-version "3.11" \
+                --python-version "3.14" \
                 --no-header --quiet \
                 --output-file payload.lock.raw) ; then
             die "uv 依赖解析失败"
         fi
-        # 去掉 '# via' 注释行，lock 只留 name==version（pip/wheel 为设备端
-        # 自举与运行时兜底额外附带）；先写 staging，全部下载成功后才转正，
-        # 避免中断后被「已缓存」分支误判为完整
+        # 去掉 '# via' 注释行，lock 只留 name==version（pip/wheel 已并入上面
+        # 的 compile）；先写 staging，全部下载成功后才转正，避免中断后被
+        # 「已缓存」分支误判为完整
         grep -E '^[a-zA-Z0-9._-]+==' "${BUILD}/payload.lock.raw" \
             > "${wheel_cache}/lock.staging" \
             || die "uv lock 输出异常（无 name==version 行）"
-        printf 'pip\nwheel\n' >> "${BUILD}/payload.lock.raw"
-        (cd "${BUILD}" && uv pip compile payload.lock.raw \
-                --default-index "${PYPI_INDEX}" \
-                --python-platform "${triple}" --python-version "3.11" \
-                --no-header --quiet --output-file payload.lock.boot) \
-            || die "uv 解析 pip/wheel 兜底失败"
-        grep -E '^[a-zA-Z0-9._-]+==' "${BUILD}/payload.lock.boot" >> "${wheel_cache}/lock.staging"
         sort -u -o "${wheel_cache}/lock.staging" "${wheel_cache}/lock.staging"
         log "lock 就绪：$(wc -l < "${wheel_cache}/lock.staging") 项"
 
@@ -699,12 +748,9 @@ print(d[sys.argv[2]])
     mkdir -p "${kernel_cache}"
     if [ ! -f "${kernel_tar}" ]; then
         local official="${kernel_cache}/cloakbrowser-${CB_PLAT}.tar.gz"
-        if [ ! -f "${official}" ]; then
-            log "下载 CloakBrowser 内核（~200MB）..."
-            curl -fSL --retry 3 --connect-timeout 20 -o "${official}" \
-                "https://github.com/CloakHQ/cloakbrowser/releases/download/chromium-v${CLOAKBROWSER_VERSION}/cloakbrowser-${CB_PLAT}.tar.gz" \
-                || die "CloakBrowser 内核下载失败（chromium-v${CLOAKBROWSER_VERSION}）"
-        fi
+        fetch_cached \
+            "https://github.com/CloakHQ/cloakbrowser/releases/download/chromium-v${CLOAKBROWSER_VERSION}/cloakbrowser-${CB_PLAT}.tar.gz" \
+            "${official}"
         log "重组内核 → chromium-${CLOAKBROWSER_VERSION}.tar"
         local tmp="${kernel_cache}/.repack"
         rm -rf "${tmp}"
@@ -746,6 +792,7 @@ pack_payload() {
 UPSTREAM_TAG=${TAG}
 ARCH=${ARCH}
 PYTHON_TAG=cp${PYV}
+PYTHON_RUNTIME=${PBS_PYTHON}+${PBS_BUILD}
 FRONTEND_VERSION=${FRONTEND_VERSION}
 CLOAKBROWSER_VERSION=${CLOAKBROWSER_VERSION}
 KERNEL_VERSION=${CLOAKBROWSER_VERSION}
@@ -759,7 +806,7 @@ EOF
     log "打包 payload.tar（未压缩）..."
     local out_rel="../payload-${ARCH}.tar"
     (cd "${BUILD}/payload" && tar -cf "${out_rel}" \
-        MoviePilot wheels payload.lock payload.meta kernel)
+        MoviePilot python wheels payload.lock payload.meta kernel)
 
     local out="${BUILD}/payload-${ARCH}.tar"
     # 校验关键执行位在 tar 中确实为 rwx（MSYS 权限映射异常时在此拦截）；
@@ -776,6 +823,7 @@ fetch_source
 stage_source
 prepare_frontend
 stage_resources
+stage_python
 fetch_wheels
 prepare_kernel
 pack_payload
