@@ -391,6 +391,10 @@ run_init() {
             --superuser "${SUPERUSER}" \
             --superuser-password "${SUPERUSER_PASSWORD}" \
             --config-dir "${CONFIG_DIR}" >> "${INSTALL_LOG}" 2>&1; then
+        # wrapper 把 Python traceback 吞在内部（exit 非 0 无输出），补一眼
+        # 运行日志尾部供事后排查（alembic 迁移等错误写在 MP 自己的 logs 里）
+        log "[DEBUG] 最近运行日志（若存在）："
+        tail -n 30 "${CONFIG_DIR}/logs/"*.log >> "${INSTALL_LOG}" 2>/dev/null || true
         fail "moviepilot init 失败（详见 ${INSTALL_LOG}）"
     fi
     log "init 完成"

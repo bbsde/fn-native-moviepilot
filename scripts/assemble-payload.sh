@@ -431,6 +431,51 @@ PYEOF
         log "local.py 已含虚拟浏览补丁（或结构变化），跳过"
     fi
 
+    # 补丁 6：init 的 sync-superuser 缺事务执行器配置。v3.0.0 正式版把无会话
+    # Oper 调用（UserOper()._db=None）委托给组合根注册的 run_sync_transaction，
+    # app.startup 组合根与测试引导都会先 configure_transaction_runners 再用
+    # Oper，唯独 local_setup 的 _ensure_superuser_account_inner 没配 →
+    # 「同步事务执行器尚未配置」RuntimeError → init 必炸。补丁在导入 UserOper
+    # 前按上游测试引导（app/testing/bootstrap.py）的模式注册事务执行器。
+    # 上游修复（自行注册执行器）后锚点消失自动停用。
+    if ! grep -q 'fn-native-moviepilot 补丁：sync-superuser 事务执行器' \
+        "${BUILD}/payload/MoviePilot/scripts/local_setup.py"; then
+        (cd "${BUILD}/payload/MoviePilot/scripts" && "${PY}" - <<'PYEOF' || die "sync-superuser 事务执行器补丁失败"
+import io
+path = "local_setup.py"
+src = io.open(path, encoding="utf-8").read()
+anchor = (
+    "    from app.application.security.token import get_password_hash\n"
+    "    from app.db.oper.user import UserOper\n"
+    "    from app.runtime.config import settings\n"
+)
+patch_body = """\
+    # fn-native-moviepilot 补丁：sync-superuser 事务执行器
+    # （UserOper 无会话构造时委托组合根注册的 run_sync_transaction，
+    #   上游组合根/测试引导均先 configure 再用 Oper，此处漏配）
+    from app.db.adapters.transaction import TransactionalWriteRunner
+    from app.db.session import SessionFactory, async_session_scope
+    from app.db.uow import configure_transaction_runners
+    _fnos_runner = TransactionalWriteRunner(
+        sync_session=SessionFactory,
+        async_session=async_session_scope,
+    )
+    configure_transaction_runners(
+        sync=_fnos_runner.sync,
+        async_=_fnos_runner.async_,
+    )
+"""
+if anchor not in src:
+    raise SystemExit("锚点未找到，上游 local_setup 结构已变化，需人工复核")
+io.open(path, "w", encoding="utf-8", newline="").write(src.replace(anchor, patch_body + anchor, 1))
+print("sync-superuser 事务执行器补丁已应用")
+PYEOF
+)
+        log "已应用 sync-superuser 事务执行器补丁（init 崩溃修复）"
+    else
+        log "sync-superuser 补丁已存在（或上游已修复），跳过"
+    fi
+
     FRONTEND_VERSION="$("${PY}" -c '
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()

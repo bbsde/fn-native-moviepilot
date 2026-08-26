@@ -6,6 +6,13 @@
 
 ---
 
+## [3.0.0.16] - 2026-08-26
+
+### 修复
+
+- **修复 3.0.0.15 安装必败**：上游 v3.0.0 正式版 `local_setup.py` 的 sync-superuser 路径未注册事务执行器——`UserOper()` 无会话构造时委托 `run_sync_transaction`，而它依赖组合根先行 `configure_transaction_runners`（`app.startup` 组合根与测试引导都配了，唯独 init 路径漏配）→ `moviepilot init` 必抛「同步事务执行器尚未配置」→ 安装失败。新增构建期补丁 #6：按上游测试引导（`app/testing/bootstrap.py`）的模式在 `_ensure_superuser_account_inner` 导入 Oper 前注册 `TransactionalWriteRunner`
+- init 失败时自动把 MoviePilot 运行日志尾部（含真实 traceback）附加进 install.log，便于事后排查（此前 wrapper 吞掉 Python 异常栈，弹窗只见「init 失败」）
+
 ## [3.0.0.15] - 2026-08-26
 
 ### 变更
