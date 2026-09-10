@@ -6,6 +6,18 @@
 
 ---
 
+## [3.0.0.18] - 2026-09-10
+
+### 修复
+
+- **飞牛统一网关路径网页端全接口失效（设置全空、持续「服务器无响应」）**：fnOS 1.2.x 统一网关（今晨重启补丁热应用后观测到）对携带 JWT 形状 `Authorization: Bearer` 的请求会误判为飞牛会话令牌做校验，失败即短路返回 HTTP 200 的 13 字节纯文本 `invalid token`——请求根本不到达应用。MoviePilot 前端 axios 恰好给每个 API 请求都带该头，于是经 `/app/moviepilot` 的所有数据接口全挂；`/api/v1/system/message` SSE 因只认资源 Cookie 成为唯一到达后端的请求，其 Cookie 过期后即用户看到的 403。已在真实飞牛会话浏览器内完成三组对照实验钉死（Bearer JWT 被拦 / Bearer 非 JWT 放行 / 无认证头放行），后端、数据库、外网连通性全程正常
+
+### 变更
+
+- **补丁 #7（后端）**：`app/adapters/web/security/access.py` 的 `verify_token` 新增 `X-MoviePilot-Token` 头依赖，在 Authorization 缺席时回退读取并按同一 JWT 语义校验；Authorization 优先级不变，非网关直连与第三方集成（`X-API-KEY`/`apikey`/`token`）不受影响
+- **补丁 #8（前端）**：`public/assets/*.js` 中 axios 两处 `Authorization: Bearer ${token}` 改发 `X-MoviePilot-Token`（按内容模式匹配 minified 产物，不写死 hash 文件名；上游换版后模式失效则记录跳过）
+- **新增「MoviePilot 直连」桌面入口**（`moviepilot.direct`，端口服务模式，跟随向导前端端口）：绕过统一网关直连前端，作为网关行为再度变化的兜底；直连路径仍需手动登录（无网关免登录）
+
 ## [3.0.0.17] - 2026-08-26
 
 ### 修复

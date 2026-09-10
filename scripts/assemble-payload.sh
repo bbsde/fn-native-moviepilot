@@ -491,6 +491,67 @@ PYEOF
         log "sync-superuser 补丁已存在（或上游已修复），跳过"
     fi
 
+    # 补丁 7：飞牛统一网关兼容（后端侧，配合补丁 8）。fnOS 1.2.x 网关观测行为：
+    # 请求携带 JWT 形状的 Authorization 头时被误判为飞牛会话令牌做校验，失败即
+    # 短路返回 200 "invalid token"，MoviePilot 网页端全部 API 失效（改经网关的
+    # 前端因此设置空、持续报服务器无响应）。前端改发 X-MoviePilot-Token 携带
+    # 同一 JWT（见 prepare_frontend 补丁 8），后端 verify_token 在 Authorization
+    # 缺席时回退读取该头；Authorization 优先级不变，非网关路径与第三方集成
+    # （X-API-KEY/apikey/token）不受影响。上游重构 verify_token 后自动跳过。
+    local access_py="${BUILD}/payload/MoviePilot/app/adapters/web/security/access.py"
+    if [ ! -f "${access_py}" ]; then
+        log "app/adapters/web/security/access.py 不存在（上游结构变化），跳过补丁 7"
+    elif grep -q 'X-MoviePilot-Token' "${access_py}"; then
+        log "verify_token 自定义头补丁已存在，跳过"
+    elif ! grep -q 'def verify_token(' "${access_py}"; then
+        log "verify_token 锚点不存在（上游已重构），跳过补丁 7"
+    else
+        (cd "${BUILD}/payload/MoviePilot/app/adapters/web/security" && "${PY}" - <<'PYEOF' || die "verify_token 自定义头补丁失败"
+import io
+
+path = "access.py"
+src = io.open(path, encoding="utf-8").read()
+
+head_anchor = "def verify_token(\n"
+head_patch = (
+    "# fn-native-moviepilot 补丁：X-MoviePilot-Token——网关兼容的 Web 令牌头\n"
+    "#（飞牛统一网关会拦截 JWT 形状的 Authorization 头，前端改发此头携带同一 JWT）\n"
+    "web_token_header = APIKeyHeader(\n"
+    '    name="X-MoviePilot-Token",\n'
+    "    auto_error=False,\n"
+    '    scheme_name="web_token_header",\n'
+    ")\n"
+    "\n"
+    "\n"
+    "def verify_token(\n"
+)
+anchor = (
+    "    api_token: Annotated[str | None, Security(_get_api_token)],\n"
+    ") -> TokenPayload:\n"
+    '    """验证 JWT、API Key 或 API Token，并维护资源 Cookie。"""\n'
+    "    if jwt_token:\n"
+)
+replacement = (
+    "    api_token: Annotated[str | None, Security(_get_api_token)],\n"
+    "    web_token: Annotated[str | None, Security(web_token_header)] = None,\n"
+    ") -> TokenPayload:\n"
+    '    """验证 JWT、API Key 或 API Token，并维护资源 Cookie。"""\n'
+    "    # fn-native-moviepilot 补丁：Authorization 缺席时回退读取网关兼容头\n"
+    "    jwt_token = jwt_token or web_token\n"
+    "    if jwt_token:\n"
+)
+if src.count(head_anchor) != 1:
+    raise SystemExit("verify_token 定义锚点异常（出现 %d 次）" % src.count(head_anchor))
+if src.count(anchor) != 1:
+    raise SystemExit("verify_token 参数块锚点异常（出现 %d 次）" % src.count(anchor))
+src = src.replace(head_anchor, head_patch, 1)
+src = src.replace(anchor, replacement, 1)
+io.open(path, "w", encoding="utf-8", newline="").write(src)
+print("verify_token 自定义头补丁已应用（X-MoviePilot-Token 回退）")
+PYEOF
+        )
+    fi
+
     FRONTEND_VERSION="$("${PY}" -c '
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
@@ -561,6 +622,42 @@ PYEOF
     log "前端就位 → payload/MoviePilot/public"
     rm -rf "${BUILD}/payload/MoviePilot/public"
     cp -a "${public}" "${BUILD}/payload/MoviePilot/public"
+
+    # 补丁 8：飞牛统一网关兼容（前端侧，配合补丁 7）。axios 拦截器不再用
+    # Authorization: Bearer 携带 JWT（网关误判为飞牛会话令牌并短路全部请求），
+    # 改发 X-MoviePilot-Token。仅替换 minified 产物中已知的两种写法（文件名
+    # 带 hash，按内容模式匹配）；上游前端换版后模式失效则记录跳过。
+    local fe_assets="${BUILD}/payload/MoviePilot/public/assets"
+    if [ ! -d "${fe_assets}" ]; then
+        log "public/assets 不存在（前端结构变化），跳过补丁 8"
+    else
+        "${PY}" - "${fe_assets}" <<'PYEOF' || die "前端自定义头补丁失败"
+import glob, io, os, re, sys
+
+assets = sys.argv[1]
+tok = r"([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)"
+# axios 实例默认头：x.set("Authorization",`Bearer ${t}`) → x.set("X-MoviePilot-Token",t)
+pat_set = re.compile(r'(\w+\.set\()"Authorization",`Bearer \$\{' + tok + r'\}`\)')
+# axios 拦截器：y.headers.Authorization=`Bearer ${t}` → y.headers["X-MoviePilot-Token"]=t
+pat_hdr = re.compile(r'(\.headers)\.Authorization=`Bearer \$\{' + tok + r'\}`\)')
+changed, skipped = [], []
+for path in sorted(glob.glob(os.path.join(assets, "*.js"))):
+    src = io.open(path, encoding="utf-8").read()
+    new = pat_set.sub(r'\1"X-MoviePilot-Token",\2)', src)
+    new = pat_hdr.sub(r'\1["X-MoviePilot-Token"]=\2)', new)
+    if new != src:
+        io.open(path, "w", encoding="utf-8", newline="").write(new)
+        changed.append(os.path.basename(path))
+    elif "X-MoviePilot-Token" in src:
+        skipped.append(os.path.basename(path))
+if changed:
+    print("前端 Authorization→X-MoviePilot-Token 已替换: " + ", ".join(changed))
+elif skipped:
+    print("前端自定义头补丁已存在，跳过: " + ", ".join(sorted(skipped)))
+else:
+    print("前端未发现 Authorization Bearer 模式（上游已变更），未做替换")
+PYEOF
+    fi
 }
 
 # --------------------------------------------------------------------------
