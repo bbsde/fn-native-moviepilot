@@ -203,25 +203,38 @@ apply(
     )],
 )
 
-# 2) bangumi.py 实例化时读取配置（CONFIG_WATCH 触发模块重建后即时生效；
-#    类属性保留官方域名作参照，self._base_url 在 __invoke 中优先命中）。
-#    锚点只锚 def 行——方法体变动不断锚
+# 2) bangumi.py 实例化时读取配置（CONFIG_WATCH 触发模块重建后即时生效）。
+#    注意 _request_plan 是 classmethod、经 cls._base_url 取值，改写必须落在
+#    类属性（type(self)）上，实例属性会被类属性遮蔽失效。
+#    正式版 v3.0.0 的 __init__ 带 `-> None:` 与 docstring，锚点随之更新
 apply(
     "bangumi/bangumi.py",
     [(
-        "    def __init__(self):\n",
-        "    def __init__(self):\n"
-        "        # fn-native-moviepilot 补丁：API 域名可配置\n"
-        "        self._base_url = f\"https://{settings.BANGUMI_API_DOMAIN}/\"\n",
+        "    def __init__(self) -> None:\n"
+        "        \"\"\"初始化同步与异步 Bangumi 请求客户端。\"\"\"\n",
+        "    def __init__(self) -> None:\n"
+        "        \"\"\"初始化同步与异步 Bangumi 请求客户端。\"\"\"\n"
+        "        # fn-native-moviepilot 补丁：API 域名可配置（api.bgm.tv 在部分地区被\n"
+        "        # SNI 层封锁，可配置镜像域名如 api.bangumi.lol）\n"
+        "        type(self)._base_url = f\"https://{get_runtime_setting('BANGUMI_API_DOMAIN', 'api.bgm.tv')}/\"\n",
     )],
 )
 
 # 3) 模块 CONFIG_WATCH + 连通性测试同步使用配置域名。
 #    CONFIG_WATCH 锚「开括号」子串——上游往集合加键不断锚
-#    （替换产生的重复元素在 set 字面量中无害）
+#    （替换产生的重复元素在 set 字面量中无害）。
+#    正式版 __init__.py 不再导入 settings 对象，改用 get_runtime_setting，
+#    需顺带补导入（锚 bangumi.py 相邻两行 import，唯一）
 apply(
     "bangumi/__init__.py",
     [
+        (
+            "from app.modules.bangumi.bangumi import BangumiApi\n"
+            "from app.runtime.log import logger\n",
+            "from app.modules.bangumi.bangumi import BangumiApi\n"
+            "from app.runtime.log import logger\n"
+            "from app.runtime.settings import get_runtime_setting\n",
+        ),
         (
             "    CONFIG_WATCH = {",
             "    # fn-native-moviepilot 补丁：域名变更加入热重建监听\n"
@@ -229,7 +242,7 @@ apply(
         ),
         (
             'get_res("https://api.bgm.tv/")',
-            'get_res(f"https://{settings.BANGUMI_API_DOMAIN}/")',
+            "get_res(f\"https://{get_runtime_setting('BANGUMI_API_DOMAIN', 'api.bgm.tv')}/\")",
         ),
     ],
 )
@@ -263,14 +276,15 @@ def apply(path, replacements, marker="fn-native-moviepilot 补丁"):
     print(f"{path}: 补丁已应用")
 
 # 1) 数据集 URL 改为实例属性：设置 GITHUB_PROXY 时前缀拼接（空值保持直连）。
-#    RHS 读的是类属性——上游换数据集地址自动跟随，不复制 URL（防静默漂移 404）
+#    RHS 读的是类属性——上游换数据集地址自动跟随，不复制 URL（防静默漂移 404）。
+#    正式版模块内无 settings 对象，改用 get_runtime_setting（anilist.py 已导入）
 apply(
     "anilist.py",
     [(
         "    def __init__(self) -> None:\n",
         "    def __init__(self) -> None:\n"
         "        # fn-native-moviepilot 补丁：中文数据集经 GITHUB_PROXY 加速（raw 直连间歇重置）\n"
-        "        self._translations_url = f\"{settings.GITHUB_PROXY or ''}{self._translations_url}\"\n",
+        "        self._translations_url = f\"{(get_runtime_setting('GITHUB_PROXY') or '')}{self._translations_url}\"\n",
     )],
 )
 # 2) GITHUB_PROXY 变更加入热重建监听（锚「开括号」子串，上游加键不断锚）

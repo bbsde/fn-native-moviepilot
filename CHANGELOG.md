@@ -6,7 +6,21 @@
 
 ---
 
+## [3.0.0.19] - 2026-09-10
+
+### 变更
+
+- **跟进上游 v3.0.0 正式版**：上游于 2026-09-10 重发 `v3.0.0` tag 并大幅重构（`app/runtime/extensions/module_manager.py` 拆分为 `module/` 包、模块配置访问从 `settings` 对象改为 `get_runtime_setting()`、Bangumi/AniList 模块重写）。3.0.0.18 手动测试构建基于发布前的旧快照，本版起跟随正式版源码
+- **补丁适配**（逐一对新源码审计锚点）：
+  - 补丁 #3（Bangumi 域名可配置）：`bangumi.py` 锚点更新为带 `-> None:` 与 docstring 的新 `__init__`；改写 `type(self)._base_url`（`_request_plan` 是 classmethod 经 `cls._base_url` 取值，实例属性会被遮蔽）；`__init__.py` 补 `get_runtime_setting` 导入并改写连通性测试 URL
+  - 补丁 #4（AniList GITHUB_PROXY）：补丁体改用 `get_runtime_setting('GITHUB_PROXY')`（正式版模块内无 settings 对象）
+  - 补丁 #2（ModuleManager resolver 自订阅）：上游已在 `module/manager.py` 自带 `owner_class is type(self)` 等价修复，自动停用
+  - 补丁 #6（init 事务执行器）：上游已自行注册 runner；游离对象 `user.update` 崩溃点（3.0.0.17 修的第二处）上游仍未修，补丁保留
+  - 补丁 #1：上游已消除错误导入，自动停用；补丁 #5（目录虚拟浏览）、#7（网关兼容后端）、#8（网关兼容前端）锚点全部确认兼容
+
 ## [3.0.0.18] - 2026-09-10
+
+> 仅本地验证构建（未正式发布）；内容随 3.0.0.19 一并发布。
 
 ### 修复
 

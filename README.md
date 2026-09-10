@@ -57,8 +57,8 @@
 
 | 架构 | 直连下载 | 加速下载（国内推荐） |
 | --- | --- | --- |
-| x86 | [moviepilot_3.0.0.18_x86.fpk](https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.18/moviepilot_3.0.0.18_x86.fpk) | [ghproxy.net](https://ghproxy.net/https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.18/moviepilot_3.0.0.18_x86.fpk) |
-| arm | [moviepilot_3.0.0.18_arm.fpk](https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.18/moviepilot_3.0.0.18_arm.fpk) | [ghproxy.net](https://ghproxy.net/https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.18/moviepilot_3.0.0.18_arm.fpk) |
+| x86 | [moviepilot_3.0.0.19_x86.fpk](https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.19/moviepilot_3.0.0.19_x86.fpk) | [ghproxy.net](https://ghproxy.net/https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.19/moviepilot_3.0.0.19_x86.fpk) |
+| arm | [moviepilot_3.0.0.19_arm.fpk](https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.19/moviepilot_3.0.0.19_arm.fpk) | [ghproxy.net](https://ghproxy.net/https://github.com/bbsde/fn-native-moviepilot/releases/download/v3.0.0.19/moviepilot_3.0.0.19_arm.fpk) |
 
 > 加速前缀为公共镜像，失效时可直连或自行更换前缀；Release 附带 `.sha256` 校验值。
 > 系统要求：fnOS ≥ 1.1.3100；依赖 nodejs_v24 运行时，安装时自动拉取。
