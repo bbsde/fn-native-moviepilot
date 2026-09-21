@@ -14,6 +14,7 @@
 - **补丁 #3（Bangumi API 域名可配置）退役**：上游 v3.0.3 原生实现 `BANGUMI_API_DOMAIN`（含图片代理 `BANGUMI_IMAGE_DOMAIN`、热重建监听、设置 UI），`_request_plan` 已改实例方法取 `self._base_url`（类属性遮蔽问题不复存在），域名/完整 URL 均可归一化
 - **行为衔接（重要）**：上游把 `BANGUMI_API_DOMAIN` 置于新开关 `BANGUMI_PROXY_ENABLE`（默认关）之下，而存量用户的 app.env 只有镜像域名没有开关——install/upgrade 回调的无梯子默认值清单补写 `BANGUMI_PROXY_ENABLE=true`（仅缺失时写入），避免升级后镜像被静默忽略、Bangumi 识别回退被封的官方域名
 - **补丁 #5（fnOS 授权目录虚拟浏览）适配**：上游 v3.0.7 的 `local.py` 不再文件级导入 `settings` 对象（改用 `get_runtime_setting`），补丁插入代码改为方法内局部导入，自包含、不随宿主导入风格漂移（此前写法构建能过、设备端目录浏览一调即 NameError）
+- **auto-follow 自动跟版流水线落地**（计划 §5）：每日 02:37（北京）定时 check 上游 v3.x，新版先构建双架构、全部成功才 tag + Release，任一失败零仓库变更零发布等下次重试；Release body 附构建补丁 applied/skipped 清单；补丁锚点结构性漂移时构建主动 die（fail-closed）转人工修锚点后 `workflow_dispatch force` 补发。上游连续 7 版未跟的根因（自动跟版一直停留在计划）自此消除
 
 ### 复核
 

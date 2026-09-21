@@ -1,4 +1,4 @@
-# Manual fpk release (v1: workflow_dispatch only).
+# Manual fpk release (workflow_dispatch only).
 #
 # Dispatch inputs:
 #   upstream — upstream MoviePilot tag (e.g. v3.0.0); "latest" resolves via API
@@ -6,8 +6,9 @@
 #   archs    — JSON array string; default ["x86_64"] (add "aarch64" for dual)
 #   publish  — when true, create tag v<appver> + GitHub Release with the fpks
 #
-# auto-follow (scheduled upstream tracking) is added in a later step; this
-# workflow stays the manual path (first-day v3.0.0 quality, per plan §5).
+# 自动跟版由 auto-follow.yml 负责（每日定时，先构建后提交语义）；本 workflow
+# 保持手动路径：上游同 tag 重发、打包层修订（.2/.3…）、auto-follow 修锚点后
+# 的 force 补发等场景走这里。
 name: release
 
 on:

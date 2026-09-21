@@ -65,7 +65,28 @@ jobs:
           MP_ARCHS: ${{ matrix.arch }}
           MP_APPVER: ${{ inputs.appver }}
           MP_UPSTREAM: ${{ inputs.upstream }}
-        run: bash ./build.sh "$MP_UPSTREAM"
+        # tee 留全量日志供补丁清单提取；pipefail 保证 build.sh 失败仍使步骤失败
+        run: |
+          set -o pipefail
+          bash ./build.sh "$MP_UPSTREAM" 2>&1 | tee build.log
+
+      # 补丁 applied/skipped 清单（assemble-payload.sh 的 [payload] 日志行），
+      # 独立 artifact——auto-follow 的 Release body 消费，不混入 fpk 产物
+      - name: Extract patch report
+        if: always()
+        run: |
+          mkdir -p patch-report
+          grep -E '补丁|上游已|前端' build.log > "patch-report/patches-${{ matrix.arch }}.txt" \
+            || echo "（构建未产出补丁日志）" > "patch-report/patches-${{ matrix.arch }}.txt"
+          cat "patch-report/patches-${{ matrix.arch }}.txt"
+
+      - name: Upload patch report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: patch-report-${{ matrix.arch }}
+          path: patch-report/*
+          if-no-files-found: warn
 
       - name: Upload fpk artifact
         uses: actions/upload-artifact@v7

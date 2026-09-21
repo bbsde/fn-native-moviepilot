@@ -1,0 +1,127 @@
+# 定时自动跟版（计划 §5 落地）：每日 check 上游 v3.x release → 有新版则
+# **先构建**双架构，全部成功后才 tag + 建 Release（先构建后提交）。
+#
+# 语义（与 docs/v3-build-plan.md §5/§11 一致）：
+#   - 上游无新版（v<上游三段>.1 tag 已存在）→ 绿色 no-op，零消耗
+#   - 任一架构构建失败 → 整个 run 失败，零仓库变更、零发布，等下次定时重试；
+#     补丁锚点结构性漂移时 assemble-payload.sh 主动 die（fail-closed），
+#     run 会红，待人工修锚点后手动 workflow_dispatch force 补发
+#   - concurrency 组互斥，与手动 release.yml 的发布互不重叠靠 tag 唯一性保证
+#   - 全程 GITHUB_TOKEN（contents:write），无需 PAT
+#   - Release body 附构建补丁 applied/skipped 清单（build-fpk 的 patch-report）
+#
+# 版本号：<上游三段>.1（上游同 tag 重发或需打包层修订时，走手动 release.yml
+# 出 .2/.3…，auto-follow 只认 .1）。
+name: auto-follow
+
+on:
+  schedule:
+    # 每日 18:37 UTC ≈ 北京 02:37，错峰（整点 cron 是 GitHub 高峰）
+    - cron: '37 18 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '忽略「已发布」检查强制构建（Release 步骤失败后补发用）'
+        type: boolean
+        default: false
+
+concurrency:
+  group: auto-follow
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: check upstream
+    runs-on: ubuntu-latest
+    outputs:
+      upstream: ${{ steps.ver.outputs.upstream }}
+      appver: ${{ steps.ver.outputs.appver }}
+      skip: ${{ steps.ver.outputs.skip }}
+    steps:
+      - name: Resolve latest upstream + 已发布判定
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(curl -fsSL --retry 3 \
+            "https://api.github.com/repos/jxxghp/MoviePilot/releases?per_page=20" \
+            | grep -o '"tag_name": *"[^"]*"' | sed 's/"tag_name": *"//;s/"//' \
+            | grep -E '^v3\.' | head -1)"
+          [ -n "${tag}" ] || { echo "未在最近 20 个 release 中找到 v3.x tag" >&2; exit 1; }
+          appver="${tag#v}.1"
+          skip=false
+          if [ "${{ inputs.force }}" != "true" ] \
+             && gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${appver}" >/dev/null 2>&1; then
+            skip=true
+          fi
+          {
+            echo "upstream=${tag}"
+            echo "appver=${appver}"
+            echo "skip=${skip}"
+          } >> "$GITHUB_OUTPUT"
+          echo "上游 ${tag} → appver ${appver}（skip=${skip}）"
+
+  build:
+    name: build
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    uses: ./.github/workflows/build-fpk.yml
+    with:
+      appver: ${{ needs.check.outputs.appver }}
+      upstream: ${{ needs.check.outputs.upstream }}
+      archs: '["x86_64","aarch64"]'
+
+  publish:
+    name: publish
+    needs: [check, build]
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download fpk artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist-all
+          pattern: moviepilot-fpk-*
+          merge-multiple: true
+
+      - name: Download patch reports
+        uses: actions/download-artifact@v8
+        with:
+          path: patches
+          pattern: patch-report-*
+
+      - name: sha256 sidecars
+        run: |
+          cd dist-all
+          for f in *.fpk; do sha256sum "$f" > "$f.sha256"; done
+          ls -lh
+
+      - name: Compose release body
+        run: |
+          {
+            echo "上游版本：jxxghp/MoviePilot ${{ needs.check.outputs.upstream }}（auto-follow 自动跟版）"
+            echo
+            echo '- `moviepilot_*_x86.fpk` — x86_64 设备'
+            echo '- `moviepilot_*_arm.fpk` — aarch64 设备'
+            echo '- 同名 `.sha256` 为校验文件'
+            echo
+            echo '### 构建补丁状态'
+            echo
+            echo '```'
+            cat patches/*/patches-*.txt 2>/dev/null || echo "（无补丁日志）"
+            echo '```'
+            echo
+            echo '安装即用，全程离线；更新方式 = 下载安装新版 fpk。'
+          } > release-body.md
+          cat release-body.md
+
+      - name: Create release with fpks
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.check.outputs.appver }}
+          name: MoviePilot fnOS ${{ needs.check.outputs.appver }}
+          body_path: release-body.md
+          files: dist-all/*
