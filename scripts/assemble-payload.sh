@@ -375,6 +375,9 @@ methods_patched = '''    def __fnos_filter_accessible(self, items: List[_SchemaF
         fn-native-moviepilot 补丁：fnOS「配置访问权限」授权目录清单
         （生命周期脚本维护于配置目录 fnos_grants.txt，一行一个绝对路径）
         """
+        # 局部导入 settings：上游 v3.0.7 起 local.py 不再文件级导入 settings
+        # 对象（改 get_runtime_setting），插入代码自包含、不随宿主导入漂移
+        from app.runtime.config import settings
         grants_file = Path(settings.CONFIG_DIR or "") / "fnos_grants.txt"
         try:
             return [

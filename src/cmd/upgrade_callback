@@ -196,8 +196,11 @@ EOF
                 && log "${_key} 已生成并写入 app.env"
         fi
     done
-    # 无梯子直连默认值（仅缺失时写入；依据见 install_callback 同名说明）
-    for _kv in "TMDB_API_DOMAIN=api.tmdb.org" "GITHUB_PROXY=https://ghproxy.net/" "BANGUMI_API_DOMAIN=api.bangumi.lol"; do
+    # 无梯子直连默认值（仅缺失时写入；依据见 install_callback 同名说明）。
+    # BANGUMI_PROXY_ENABLE：上游 v3.0.3 原生 Bangumi 代理的开关（默认关），
+    # 存量 3.0.0.x 用户 app.env 已有镜像域名但无此开关，升级后不补写会被
+    # 上游忽略 → Bangumi 识别静默回退被封官方域名
+    for _kv in "TMDB_API_DOMAIN=api.tmdb.org" "GITHUB_PROXY=https://ghproxy.net/" "BANGUMI_API_DOMAIN=api.bangumi.lol" "BANGUMI_PROXY_ENABLE=true"; do
         _key="${_kv%%=*}" _val="${_kv#*=}"
         if ! grep -qE "^[[:space:]]*${_key}=" "${local_keys_env}"; then
             printf "%s='%s'\n" "${_key}" "${_val}" >> "${local_keys_env}" \

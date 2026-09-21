@@ -6,6 +6,20 @@
 
 ---
 
+## [3.0.7.1] - 2026-09-22
+
+### 变更
+
+- **跟进上游 v3.0.7**（跨 3.0.1~3.0.7 七个上游版本，主要新特性：音乐自动化主流程收尾、Bangumi 数据/图片内置代理（v3.0.3）、分身独立日志等级与按后缀恢复（v3.0.2）、字幕自定义集偏移（v3.0.4）、GitHub Token 设备授权（v3.0.7））
+- **补丁 #3（Bangumi API 域名可配置）退役**：上游 v3.0.3 原生实现 `BANGUMI_API_DOMAIN`（含图片代理 `BANGUMI_IMAGE_DOMAIN`、热重建监听、设置 UI），`_request_plan` 已改实例方法取 `self._base_url`（类属性遮蔽问题不复存在），域名/完整 URL 均可归一化
+- **行为衔接（重要）**：上游把 `BANGUMI_API_DOMAIN` 置于新开关 `BANGUMI_PROXY_ENABLE`（默认关）之下，而存量用户的 app.env 只有镜像域名没有开关——install/upgrade 回调的无梯子默认值清单补写 `BANGUMI_PROXY_ENABLE=true`（仅缺失时写入），避免升级后镜像被静默忽略、Bangumi 识别回退被封的官方域名
+- **补丁 #5（fnOS 授权目录虚拟浏览）适配**：上游 v3.0.7 的 `local.py` 不再文件级导入 `settings` 对象（改用 `get_runtime_setting`），补丁插入代码改为方法内局部导入，自包含、不随宿主导入风格漂移（此前写法构建能过、设备端目录浏览一调即 NameError）
+
+### 复核
+
+- 补丁 #1（security.access 错误导入）、#2（ModuleManager 自订阅）维持「上游已修自动停用」；#4、#6、#7 锚点对 v3.0.7 全部命中；#8 的 axios 两处 minified 模式在新前端产物（FRONTEND_VERSION v3.0.7）上本地预演可替换（`default-*.js` 与 `index-*.js` 各一处）
+- #6 依赖的组合根构造 `TransactionalWriteRunner(sync_session=SessionFactory, async_session=async_session_scope)` 上游未变（`SessionFactory` 虽改为转发函数，组合根同样直接传引用）；上游 `required-version` 放宽为 `>=0.12.5`，CI 钉死的 uv 0.12.5 仍满足，v3.0.7 的 uv.lock（revision 3）经 0.12.5 本地 `export --frozen` 预演通过
+
 ## [3.0.0.20] - 2026-09-10
 
 ### 变更
