@@ -6,6 +6,20 @@
 
 ---
 
+## [3.2.1.1] - 2026-10-27
+
+### 变更
+
+- **跟进上游 v3.2.1**（auto-follow 首次 force 补发；此前 v3.0.8 起上游连续发版，补丁 #5 锚点漂移触发 fail-closed，自动跟版连续 9 日红 run 等待人工修锚）
+- **补丁 #5（fnOS 授权目录虚拟浏览）重锚**：v3.2.1 重构 `LocalStorage.list`——遍历改经新增的 `__stat_subitem` 辅助方法（walrus 写法，枚举后消失的子项跳过不再中断整次列举），元数据读取改走 `fsproxy`。锚点随新结构重写；权限语义未变（`list_sub_directory`/`list_sub_file` 的 `iterdir` 与 `fsproxy.stat` 均原样抛 `OSError`），`try/except PermissionError` 范围与 `__fnos_grant_view` 挂接点照旧；`create_folder` 签名未动，helper 插入锚点不变
+- **补丁 #7（网关兼容后端）重锚并去 docstring 化**：v3.2.1 改写 `verify_token` docstring（单行改多行）致原锚点必失配。锚点拆为两段——`web_token` 参数插入锚定「参数表结尾」，回退逻辑插入锚定 JWT 首分支语句（`if jwt_token:` + `_decode_or_http_error` 调用，均全文件唯一），不再绑定 docstring 文案
+- **补丁 #6（init 事务执行器）退役**：上游 v3.2.1 自修——`local_setup.py` 新增 `_run_with_local_database_transactions` 事务作用域，两个 superuser 调用点（init 与 sync 命令）均已包住；游离对象 `user.update(user_oper._db, ...)` 亦改为 `user_oper.update(user.id, ...)`（Oper 内按 id 重查）。检测到上游修复模式即自动跳过
+
+### 复核
+
+- 补丁 #1/#2/#3 维持「上游已修自动停用」；#4（AniList GITHUB_PROXY）锚点对 v3.2.1 命中照常应用；#8（网关兼容前端）在新 dist（FRONTEND_VERSION v3.2.1，与后端同版）上替换成功（`default-*.js` 与 `main-*.js` 各一处，非静默跳过）
+- 上游 `required-version` 维持 `>=0.12.5`，CI 钉死的 uv 0.12.5 仍满足；x86_64/aarch64 双架构本地全量 assemble 预演通过（各 174 wheels、内核 chromium-146.0.7680.177.x、内置 CPython 3.14.7；补丁后 `local.py`/`access.py`/`local_setup.py` py_compile 通过，`verify_token` 签名含 `web_token` 默认参数经 AST 复核）
+
 ## [3.0.7.1] - 2026-09-22
 
 ### 变更

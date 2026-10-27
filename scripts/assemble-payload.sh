@@ -311,6 +311,7 @@ PYEOF
     # 授权目录的祖先时合成「下一跳」虚拟子目录（授权清单由生命周期脚本维护
     # 于配置目录 fnos_grants.txt），浏览器得以逐级展开到授权目录本体（其内
     # 为原生真实读写）。上游重构 list/create_folder（锚点消失）→ 构建 die。
+    # （v3.2.1 list() 遍历改经 __stat_subitem，已随新结构重锚，见下方说明）
     if ! grep -q '__fnos_grant_view' \
         "${BUILD}/payload/MoviePilot/app/modules/filemanager/storages/local.py"; then
         (cd "${BUILD}/payload/MoviePilot/app/modules/filemanager/storages" && "${PY}" - <<'PYEOF' || die "fnOS 授权目录虚拟浏览补丁失败"
@@ -322,25 +323,29 @@ if "fn-native-moviepilot 补丁" in src:
     print("local.py: 已有补丁标记，跳过")
     raise SystemExit(0)
 
+# 上游 v3.2.1 重构 list()：遍历改经 __stat_subitem（枚举后消失的子项跳过不中
+# 断），锚点随新结构重写。list_sub_directory/list_sub_file 的 iterdir 仍不捕
+# 获 PermissionError、fsproxy.stat 亦原样抛 OSError，try/except 范围语义与
+# v3.0.x 时代补丁一致；create_folder 签名未变，methods_anchor 不动
 list_anchor = (
-    "        # 扁历所有目录\n"
     "        for item in SystemUtils.list_sub_directory(path_obj):\n"
-    "            ret_items.append(self.__get_diritem(item))\n"
+    "            if sub_item := self.__stat_subitem(item):\n"
+    "                ret_items.append(sub_item)\n"
     "\n"
-    "        # 遍历所有文件，不含子目录\n"
     "        for item in SystemUtils.list_sub_file(path_obj):\n"
-    "            ret_items.append(self.__get_fileitem(item))\n"
+    "            if sub_item := self.__stat_subitem(item, is_file=True):\n"
+    "                ret_items.append(sub_item)\n"
     "        return ret_items\n"
 )
 list_patched = (
-    "        # 扁历所有目录\n"
     "        try:\n"
     "            for item in SystemUtils.list_sub_directory(path_obj):\n"
-    "                ret_items.append(self.__get_diritem(item))\n"
+    "                if sub_item := self.__stat_subitem(item):\n"
+    "                    ret_items.append(sub_item)\n"
     "\n"
-    "            # 遍历所有文件，不含子目录\n"
     "            for item in SystemUtils.list_sub_file(path_obj):\n"
-    "                ret_items.append(self.__get_fileitem(item))\n"
+    "                if sub_item := self.__stat_subitem(item, is_file=True):\n"
+    "                    ret_items.append(sub_item)\n"
     "        except PermissionError:\n"
     "            # fn-native-moviepilot 补丁：fnOS trimacl 卷未授权层可穿透不可\n"
     "            # 列举，不再向上抛 500，交由下方授权目录虚拟浏览处理\n"
@@ -454,9 +459,16 @@ PYEOF
     # Oper，唯独 local_setup 的 _ensure_superuser_account_inner 没配 →
     # 「同步事务执行器尚未配置」RuntimeError → init 必炸。补丁在导入 UserOper
     # 前按上游测试引导（app/testing/bootstrap.py）的模式注册事务执行器。
-    # 上游修复（自行注册执行器）后锚点消失自动停用。
-    if ! grep -q 'fn-native-moviepilot 补丁：sync-superuser 事务执行器' \
+    # v3.2.1 上游自修：local_setup 新增 _run_with_local_database_transactions
+    # 事务作用域包住两个 superuser 调用点，UserOper.update 亦改按 id 重查
+    # （游离对象 update 一并修复）→ 检测到上游修复即自动退役。
+    if grep -q 'fn-native-moviepilot 补丁：sync-superuser 事务执行器' \
         "${BUILD}/payload/MoviePilot/scripts/local_setup.py"; then
+        log "sync-superuser 补丁已存在（或上游已修复），跳过"
+    elif grep -q 'user_oper.update(user.id, update_payload)' \
+        "${BUILD}/payload/MoviePilot/scripts/local_setup.py"; then
+        log "上游已修复 local_setup 事务作用域与游离对象 update，补丁 6 退役"
+    else
         (cd "${BUILD}/payload/MoviePilot/scripts" && "${PY}" - <<'PYEOF' || die "sync-superuser 事务执行器补丁失败"
 import io
 path = "local_setup.py"
@@ -504,8 +516,6 @@ print("sync-superuser 事务执行器补丁已应用（runner 注册 + update �
 PYEOF
 )
         log "已应用 sync-superuser 事务执行器补丁（init 崩溃修复）"
-    else
-        log "sync-superuser 补丁已存在（或上游已修复），跳过"
     fi
 
     # 补丁 7：飞牛统一网关兼容（后端侧，配合补丁 8）。fnOS 1.2.x 网关观测行为：
@@ -542,27 +552,36 @@ head_patch = (
     "\n"
     "def verify_token(\n"
 )
-anchor = (
+# 上游 v3.2.1 起 verify_token docstring 改多行文案，锚点不再绑定 docstring：
+# 参数插入锚定「参数表结尾」，回退插入锚定 JWT 首分支（两锚点均全文件唯一）
+param_anchor = (
     "    api_token: Annotated[str | None, Security(_get_api_token)],\n"
     ") -> TokenPayload:\n"
-    '    """验证 JWT、API Key 或 API Token，并维护资源 Cookie。"""\n'
-    "    if jwt_token:\n"
 )
-replacement = (
+param_patch = (
     "    api_token: Annotated[str | None, Security(_get_api_token)],\n"
     "    web_token: Annotated[str | None, Security(web_token_header)] = None,\n"
     ") -> TokenPayload:\n"
-    '    """验证 JWT、API Key 或 API Token，并维护资源 Cookie。"""\n'
+)
+body_anchor = (
+    "    if jwt_token:\n"
+    '        payload = _decode_or_http_error(jwt_token, "authentication")\n'
+)
+body_patch = (
     "    # fn-native-moviepilot 补丁：Authorization 缺席时回退读取网关兼容头\n"
     "    jwt_token = jwt_token or web_token\n"
     "    if jwt_token:\n"
+    '        payload = _decode_or_http_error(jwt_token, "authentication")\n'
 )
 if src.count(head_anchor) != 1:
     raise SystemExit("verify_token 定义锚点异常（出现 %d 次）" % src.count(head_anchor))
-if src.count(anchor) != 1:
-    raise SystemExit("verify_token 参数块锚点异常（出现 %d 次）" % src.count(anchor))
+if src.count(param_anchor) != 1:
+    raise SystemExit("verify_token 参数块锚点异常（出现 %d 次）" % src.count(param_anchor))
+if src.count(body_anchor) != 1:
+    raise SystemExit("verify_token JWT 分支锚点异常（出现 %d 次）" % src.count(body_anchor))
 src = src.replace(head_anchor, head_patch, 1)
-src = src.replace(anchor, replacement, 1)
+src = src.replace(param_anchor, param_patch, 1)
+src = src.replace(body_anchor, body_patch, 1)
 io.open(path, "w", encoding="utf-8", newline="").write(src)
 print("verify_token 自定义头补丁已应用（X-MoviePilot-Token 回退）")
 PYEOF
